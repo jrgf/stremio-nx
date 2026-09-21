@@ -1,0 +1,501 @@
+import { $ } from './$';
+import { bufferSourceToArrayBuffer, pathToString } from './utils';
+import {
+	kNativeFileSource,
+	type NativeFileSource,
+} from './polyfills/streams';
+import { File } from './polyfills/file';
+import { decoder } from './polyfills/text-decoder';
+import { encoder } from './polyfills/text-encoder';
+import type { PathLike } from './switch';
+import type { BufferSource } from './types';
+
+/**
+ * Default chunk size for {@link FsFile.stream | `FsFile#stream()`}, chosen by
+ * memory regime. Each chunk is a full async thread-pool round-trip
+ * (`$.fread` dispatch + promise + ReadableStream `pull()`), so per-chunk
+ * overhead — not the read itself — dominates throughput at small sizes
+ * (measured on-device: ~0.6 MB/s @ 64 KiB vs ~10 MB/s @ 1 MiB for a raw read).
+ *
+ * But a large chunk also amplifies peak memory when piped into a
+ * `DecompressionStream` (1 MiB in → ~1.8 MiB out, several in flight at once,
+ * plus the decoder's realloc-grow spikes), which the applet regime's
+ * ~30 MiB native-heap headroom cannot absorb — on-device, 1 MiB faulted and
+ * even 256 KiB OOM'd partway through a large stream. So gate it:
+ *   - Application regime (~3 GiB): 1 MiB — the full ~15x throughput win.
+ *   - Applet regime (~380 MiB): 64 KiB — the conservative value that reliably
+ *     completes large streams within the tight native-heap budget. (The
+ *     transparent native fused read+decompress path is what makes streaming
+ *     decompression fast in applet mode; see compression-streams.ts.)
+ * Callers that know their memory budget can override via `chunkSize`.
+ */
+function defaultStreamChunkSize(): number {
+	// AppletType.Application === 0; anything else is an applet regime.
+	const isApplication = $.appletGetAppletType() === 0;
+	return isApplication ? 1024 * 1024 : 65536;
+}
+
+/**
+ * Information about a directory entry returned from {@link readDir | `Switch.readDir()`}.
+ */
+export interface DirEntry {
+	/** The file name of the entry (not the full path). */
+	name: string;
+	/** `true` if this is a regular file. */
+	isFile: boolean;
+	/** `true` if this is a directory. */
+	isDirectory: boolean;
+	/** `true` if this is a symbolic link. */
+	isSymlink: boolean;
+}
+
+export interface ReadFileOptions {
+	/**
+	 * Byte offset to start reading the file from.
+	 *
+	 * @default 0
+	 */
+	start?: number;
+
+	/**
+	 * Byte offset to stop reading the file at (inclusive).
+	 *
+	 * @default Infinity
+	 */
+	end?: number;
+}
+
+/**
+ * Creates the directory at the provided `path`, as well as any necessary parent directories.
+ *
+ * @example
+ *
+ * ```typescript
+ * const count = await Switch.mkdir('sdmc:/foo/bar/baz');
+ * console.log(`Created ${count} directories`);
+ * // Created 3 directories
+ * ```
+ *
+ * @param path Path of the directory to create.
+ * @param mode The file mode to set for the directories. Default: `0o777`.
+ * @returns A Promise which resolves to the number of directories created. If the directory already exists, resolves to `0`.
+ */
+export function mkdir(path: PathLike, mode = 0o777) {
+	return $.mkdir(pathToString(path), mode);
+}
+
+/**
+ * Creates the directory at the provided `path`, as well as any necessary parent directories.
+ *
+ * @example
+ *
+ * ```typescript
+ * const count = Switch.mkdirSync('sdmc:/foo/bar/baz');
+ * console.log(`Created ${count} directories`);
+ * // Created 3 directories
+ * ```
+ *
+ * @param path Path of the directory to create.
+ * @param mode The file mode to set for the directories. Default: `0o777`.
+ * @returns The number of directories created. If the directory already exists, returns `0`.
+ */
+export function mkdirSync(path: PathLike, mode = 0o777) {
+	return $.mkdirSync(pathToString(path), mode);
+}
+
+/**
+ * Returns a Promise which resolves to an `ArrayBuffer` containing
+ * the contents of the file at `path`.
+ *
+ * @example
+ *
+ * ```typescript
+ * const buffer = await Switch.readFile('sdmc:/switch/awesome-app/state.json');
+ * const gameState = JSON.parse(new TextDecoder().decode(buffer));
+ * ```
+ */
+export function readFile(path: PathLike, opts?: ReadFileOptions) {
+	return $.readFile(pathToString(path), opts);
+}
+
+/**
+ * Returns an `AsyncIterable` that yields {@link DirEntry} objects for each
+ * entry within `path`, one at a time. The directory handle is automatically
+ * closed when iteration completes or the loop is exited early.
+ *
+ * @example
+ *
+ * ```typescript
+ * for await (const entry of Switch.readDir('sdmc:/')) {
+ *   console.log(entry.name, entry.isFile ? 'file' : 'dir');
+ * }
+ * ```
+ *
+ * @example
+ *
+ * To collect all entries into an array:
+ *
+ * ```typescript
+ * const entries = await Array.fromAsync(Switch.readDir('sdmc:/'));
+ * ```
+ *
+ * @param path Path of the directory to read.
+ */
+export function readDir(path: PathLike): AsyncIterable<DirEntry> {
+	const p = pathToString(path);
+	return {
+		[Symbol.asyncIterator]() {
+			let handle: object | null = null;
+			let started = false;
+			let done = false;
+			return {
+				async next(): Promise<IteratorResult<DirEntry>> {
+					if (!started) {
+						started = true;
+						handle = await $.openDir(p);
+					}
+					if (done) {
+						return { value: undefined, done: true };
+					}
+					const entry = await $.readDirNext(handle!);
+					if (entry === null) {
+						done = true;
+						await $.closeDir(handle!);
+						handle = null;
+						return { value: undefined, done: true };
+					}
+					return { value: entry, done: false };
+				},
+				async return(): Promise<IteratorResult<DirEntry>> {
+					if (handle && !done) {
+						done = true;
+						await $.closeDir(handle);
+						handle = null;
+					}
+					return { value: undefined, done: true };
+				},
+			};
+		},
+	};
+}
+
+/**
+ * Synchronously returns an array of the file names within `path`.
+ *
+ * @example
+ *
+ * ```typescript
+ * for (const file of Switch.readDirSync('sdmc:/')) {
+ *   // … do something with `file` …
+ * }
+ * ```
+ */
+export function readDirSync(path: PathLike) {
+	return $.readDirSync(pathToString(path));
+}
+
+/**
+ * Synchronously returns an `ArrayBuffer` containing the contents
+ * of the file at `path`.
+ *
+ * @example
+ *
+ * ```typescript
+ * const buffer = Switch.readFileSync('sdmc:/switch/awesome-app/state.json');
+ * const appState = JSON.parse(new TextDecoder().decode(buffer));
+ * ```
+ */
+export function readFileSync(path: PathLike, opts?: ReadFileOptions) {
+	return $.readFileSync(pathToString(path), opts);
+}
+
+/**
+ * Returns a Promise which resolves after writing the contents of `data`
+ * to the file at `path`. Parent directories are created automatically.
+ *
+ * @example
+ *
+ * ```typescript
+ * const appStateJson = JSON.stringify(appState);
+ * await Switch.writeFile('sdmc:/switch/awesome-app/state.json', appStateJson);
+ * ```
+ */
+export function writeFile(
+	path: PathLike,
+	data: string | BufferSource,
+): Promise<void> {
+	const d = typeof data === 'string' ? encoder.encode(data) : data;
+	const ab = bufferSourceToArrayBuffer(d);
+	return $.writeFile(pathToString(path), ab);
+}
+
+/**
+ * Synchronously writes the contents of `data` to the file at `path`.
+ *
+ * @example
+ *
+ * ```typescript
+ * const appStateJson = JSON.stringify(appState);
+ * Switch.writeFileSync('sdmc:/switch/awesome-app/state.json', appStateJson);
+ * ```
+ */
+export function writeFileSync(path: PathLike, data: string | BufferSource) {
+	const d = typeof data === 'string' ? encoder.encode(data) : data;
+	const ab = bufferSourceToArrayBuffer(d);
+	return $.writeFileSync(pathToString(path), ab);
+}
+
+/**
+ * Synchronously appends `data` to the end of the file at `path`, creating the
+ * file (and any parent directories) if it does not exist.
+ *
+ * @param path The path of the file to append to.
+ * @param data The data to append (string is UTF-8 encoded).
+ *
+ * @example
+ *
+ * ```typescript
+ * Switch.appendFileSync('sdmc:/switch/awesome-app/log.txt', `${line}\n`);
+ * ```
+ */
+export function appendFileSync(path: PathLike, data: string | BufferSource) {
+	const d = typeof data === 'string' ? encoder.encode(data) : data;
+	const ab = bufferSourceToArrayBuffer(d);
+	return $.appendFileSync(pathToString(path), ab);
+}
+
+/**
+ * Removes the file or directory recursively specified by `path`.
+ *
+ * @param path File path to remove.
+ */
+export function remove(path: PathLike) {
+	return $.remove(pathToString(path));
+}
+
+/**
+ * Synchronously removes the file or directory recursively specified by `path`.
+ *
+ * @param path File path to remove.
+ */
+export function removeSync(path: PathLike) {
+	$.removeSync(pathToString(path));
+}
+
+/**
+ * Renames a file or directory.
+ *
+ * @param path Source file path to rename.
+ * @param dest Destination file path to rename to.
+ */
+export function rename(path: PathLike, dest: PathLike) {
+	return $.rename(pathToString(path), pathToString(dest));
+}
+
+/**
+ * Synchronously renames a file or directory.
+ *
+ * @param path Source file path to rename.
+ * @param dest Destination file path to rename to.
+ */
+export function renameSync(path: PathLike, dest: PathLike) {
+	$.renameSync(pathToString(path), pathToString(dest));
+}
+
+/**
+ *
+ * @param path File path to retrieve file stats for.
+ * @returns Object containing the file stat information of `path`, or `null` if the file does not exist.
+ */
+export function statSync(path: PathLike) {
+	return $.statSync(pathToString(path));
+}
+
+/**
+ * Returns a Promise which resolves to an object containing
+ * information about the file pointed to by `path`.
+ *
+ * @param path File path to retrieve file stats for.
+ */
+export function stat(path: PathLike) {
+	return $.stat(pathToString(path));
+}
+
+/**
+ * Options object for the {@link file | `Switch.file()`} function.
+ */
+export interface FsFileOptions extends ReadFileOptions {
+	type?: string;
+
+	/**
+	 * Create a "big file", which is a directory with the "archive" bit set.
+	 * This will cause HOS to treat the directory as if it were a file
+	 * containing the directory's concatenated contents, allowing you to
+	 * write file contents larger than 4GB.
+	 */
+	bigFile?: boolean;
+}
+
+/**
+ * Options object for the {@link FsFile.stream | `Switch.FsFile#stream()`} function.
+ */
+export interface FsFileStreamOptions {
+	/**
+	 * The size of each chunk to read from the file.
+	 *
+	 * Defaults to a memory-regime-aware size: 1 MiB in the application regime,
+	 * 64 KiB in the (memory-constrained) applet regime. Larger chunks read
+	 * faster but raise peak memory when piped into a `DecompressionStream`.
+	 *
+	 * @default 1048576 (application regime) / 65536 (applet regime)
+	 */
+	chunkSize?: number;
+}
+
+/**
+ * Returns a {@link FsFile | `Switch.FsFile`} instance for the given `path`.
+ *
+ * @param path
+ */
+export function file(path: PathLike, opts?: FsFileOptions) {
+	return new FsFile(path, opts);
+}
+
+/**
+ * The `Switch.FsFile` class is a special implementation of the
+ * global {@link File | `File`} class, which interacts with the
+ * system's physical file system.
+ *
+ * It offers a convenient API for working with existing files, and
+ * also for writing files.
+ */
+export class FsFile extends File {
+	start?: number;
+	end?: number;
+
+	constructor(path: PathLike, opts?: FsFileOptions) {
+		const { bigFile, start, end, ...rest } = opts ?? {};
+		super([], pathToString(path), {
+			type: 'text/plain;charset=utf-8',
+			...rest,
+		});
+		this.start = start;
+		this.end = end;
+		Object.defineProperty(this, 'lastModified', {
+			get(): number {
+				return (statSync(this.name)?.mtime ?? 0) * 1000;
+			},
+		});
+		if (bigFile) {
+			$.fsCreateBigFile(this.name);
+		}
+	}
+
+	get size() {
+		const stat = statSync(this.name);
+		if (!stat) return 0;
+		const start = this.start ?? 0;
+		const end = Math.min(this.end ?? Infinity, stat.size);
+		return end - start;
+	}
+
+	stat() {
+		return stat(this.name);
+	}
+
+	slice(start?: number, end?: number, type?: string): FsFile {
+		const thisStart = this.start ?? 0;
+		const thisEnd = this.end ?? Infinity;
+		const s = (start ?? 0) + thisStart;
+		const newEnd = thisStart + (end ?? Infinity);
+		const e = Math.min(thisEnd, newEnd);
+		return new FsFile(this.name, {
+			type: type ?? this.type,
+			start: s,
+			end: e,
+		});
+	}
+
+	async arrayBuffer(): Promise<ArrayBuffer> {
+		const b = await readFile(this.name, this);
+		if (!b) {
+			throw new Error(`File does not exist: "${this.name}"`);
+		}
+		return b;
+	}
+
+	async text(): Promise<string> {
+		return decoder.decode(await this.arrayBuffer());
+	}
+
+	async json(): Promise<any> {
+		return JSON.parse(await this.text());
+	}
+
+	stream(opts?: FsFileStreamOptions): ReadableStream<Uint8Array> {
+		const { name, start, end } = this;
+		let offset = start ?? 0;
+		const chunkSize = opts?.chunkSize || defaultStreamChunkSize();
+		let h: Awaited<ReturnType<typeof $.fopen>> | undefined | null;
+		const stream = new ReadableStream({
+			type: 'bytes',
+			async pull(controller) {
+				if (!h) h = await $.fopen(name, 'rb', start);
+				const remaining = end ? end - offset : Infinity;
+				if (remaining <= 0) {
+					controller.close();
+					await $.fclose(h);
+					h = null;
+					return;
+				}
+				const b = new Uint8Array(Math.min(chunkSize, remaining));
+				const n = await $.fread(h, b.buffer);
+				if (n === null) {
+					controller.close();
+					await $.fclose(h);
+					h = null;
+				} else if (n > 0) {
+					offset += n;
+					controller.enqueue(n < b.length ? b.subarray(0, n) : b);
+				}
+			},
+			async cancel() {
+				if (h) {
+					await $.fclose(h);
+				}
+			},
+		});
+		// Tag the stream as a native file source so that
+		// `.pipeThrough(new DecompressionStream(...))` can take the fused
+		// native read+decompress fast path (see polyfills/streams.ts). This is
+		// purely additive: the stream still works as a normal byte stream when
+		// read directly or piped to anything else.
+		Object.defineProperty(stream, kNativeFileSource, {
+			value: { path: name, start: start ?? 0, end } as NativeFileSource,
+			enumerable: false,
+		});
+		return stream;
+	}
+
+	get writable() {
+		const { name } = this;
+		let h: Awaited<ReturnType<typeof $.fopen>> | undefined | null;
+		return new WritableStream<BufferSource | string>({
+			async write(chunk) {
+				if (!h) h = await $.fopen(name, 'w');
+				await $.fwrite(
+					h,
+					typeof chunk === 'string'
+						? encoder.encode(chunk).buffer
+						: bufferSourceToArrayBuffer(chunk),
+				);
+			},
+			async close() {
+				if (h) {
+					await $.fclose(h);
+					h = null;
+				}
+			},
+		});
+	}
+}

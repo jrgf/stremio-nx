@@ -1,0 +1,31 @@
+{
+  "name": "stremio-nx",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Independent Stremio-compatible video player for Nintendo Switch homebrew",
+  "author": "jrgf",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:app",
+    "nro": "bash scripts/package-nro.sh",
+    "build:nro": "bash scripts/build-runtime.sh && npm run build:app && npm run nro && node scripts/verify-nro.mjs",
+    "core-flow": "esbuild --bundle --platform=node --target=node22 --format=esm --loader:.wasm=binary --outfile=host-test/dist/core-flow.mjs host-test/core-flow.ts && node host-test/dist/core-flow.mjs",
+    "host-test": "npm run host-test:unit",
+    "host-test:unit": "esbuild --bundle --loader:.wasm=binary --platform=node --target=node22 --format=esm --outdir=host-test/dist --out-extension:.js=.mjs host-test/http.test.ts host-test/sha1.test.ts host-test/torrent.test.ts host-test/tracker.test.ts host-test/wire.test.ts host-test/metadata.test.ts host-test/pieces.test.ts host-test/engine.test.ts host-test/dht.test.ts host-test/control.test.ts host-test/ui.test.ts host-test/platform.test.ts host-test/addons.test.ts host-test/subtitles.test.ts host-test/http-stream.test.ts && node --test --test-force-exit host-test/dist/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "build:app": "esbuild --bundle --loader:.wasm=binary --sourcemap --sources-content=false --target=es2022 --format=esm --outdir=romfs src/app/main.ts && cp src/app/nxjs.ini romfs/",
+    "engine-live": "esbuild --bundle --platform=node --target=node22 --format=esm --outfile=host-test/dist/engine-live.mjs host-test/engine-live.ts && node host-test/dist/engine-live.mjs",
+    "dht-live": "esbuild --bundle --platform=node --target=node22 --format=esm --outfile=host-test/dist/dht-live.mjs host-test/dht-live.ts && node host-test/dist/dht-live.mjs"
+  },
+  "dependencies": {
+    "@stremio/stremio-core-web": "0.62.1"
+  },
+  "devDependencies": {
+    "@nx.js/nro": "1.0.0-beta.6",
+    "@nx.js/runtime": "1.0.0-beta.6",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.6.0"
+  }
+}

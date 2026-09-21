@@ -1,0 +1,60 @@
+name: Build NRO
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nro-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            runtime/nxjs/package-lock.json
+      - name: Install app and runtime dependencies
+        run: |
+          npm ci --no-audit --no-fund
+          npm ci --prefix runtime/nxjs --no-audit --no-fund
+      - name: Check types and playback regressions
+        run: |
+          npm run typecheck
+          npm run host-test:unit
+          node host-test/player-check.mjs
+          node host-test/video-render-check.mjs
+      - name: Build and verify the NRO
+        run: |
+          mkdir -p artifacts
+          npm run build:nro > artifacts/build.log 2>&1 || { tail -n 100 artifacts/build.log; exit 1; }
+          cp stremio-nx.nro LICENSE COPYRIGHT THIRD_PARTY_NOTICES.txt LICENSE_REVIEW.md artifacts/
+          git archive --format=tar.gz --output=artifacts/project-source.tar.gz HEAD
+      - name: Upload NRO, notices and project source
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stremio-nx-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload failed build log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nro-build-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/build.log
+          if-no-files-found: ignore
+          retention-days: 7

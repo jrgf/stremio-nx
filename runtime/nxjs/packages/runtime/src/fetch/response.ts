@@ -1,0 +1,140 @@
+import { encoder } from '../polyfills/text-encoder';
+import { URL } from '../polyfills/url';
+import { def } from '../utils';
+import { Body, type BodyInit } from './body';
+import { Headers, type HeadersInit } from './headers';
+
+export interface ResponseInit {
+	/** Headers for the response. */
+	headers?: HeadersInit;
+	/** HTTP status code for the response. */
+	status?: number;
+	/** Status text for the response. */
+	statusText?: string;
+}
+
+export type ResponseType =
+	| 'basic'
+	| 'cors'
+	| 'default'
+	| 'error'
+	| 'opaque'
+	| 'opaqueredirect';
+
+/**
+ * Class representing a HTTP response.
+ */
+export class Response extends Body implements globalThis.Response {
+	/** Whether the response was redirected. */
+	redirected: boolean;
+	/** HTTP status code of the response. */
+	status: number;
+	/** Status text of the response. */
+	statusText: string;
+	/** Type of the response. */
+	type: ResponseType;
+	/** URL of the response. */
+	url: string;
+
+	/**
+	 * Create a new Response.
+	 * @param body - The body of the response.
+	 * @param init - Initialization options for the response.
+	 */
+	constructor(body?: BodyInit | null, init: ResponseInit = {}) {
+		super(body, init.headers);
+		this.redirected = false;
+		this.status = init.status ?? 200;
+		this.statusText = init.statusText ?? '';
+		this.type = 'default';
+		this.url = '';
+	}
+
+	/**
+	 * Check if the response was successful.
+	 * @returns {boolean} - True if the status is between 200 and 299, inclusive.
+	 */
+	get ok(): boolean {
+		return this.status >= 200 && this.status < 300;
+	}
+
+	/**
+	 * Clone the response.
+	 * @returns {Response} - A copy of the response with a tee'd body stream.
+	 */
+	clone(): Response {
+		if (this.bodyUsed || this.body?.locked) {
+			throw new TypeError(
+				"Failed to execute 'clone' on 'Response': Response body is already used",
+			);
+		}
+		const [body1, body2] = this.body ? this.body.tee() : [null, null];
+		// Replace our body with one branch, give the clone the other
+		this.body = body1;
+		const cloned = new Response(body2, {
+			status: this.status,
+			statusText: this.statusText,
+			headers: new Headers(this.headers),
+		});
+		cloned.type = this.type;
+		cloned.url = this.url;
+		cloned.redirected = this.redirected;
+		return cloned;
+	}
+
+	/**
+	 * Create a new error response.
+	 * @returns {Response} - The new error response.
+	 */
+	static error(): Response {
+		const res = new Response();
+		res.status = 0;
+		res.type = 'error';
+		return res;
+	}
+
+	/**
+	 * Create a new redirect response.
+	 * @param {string | URL} url - The URL to redirect to.
+	 * @param {number} status - The status code for the redirect, defaults to 302.
+	 * @returns {Response} - The new redirect response.
+	 */
+	static redirect(url: string | URL, status: number = 302): Response {
+		let parsedUrl: URL;
+		try {
+			parsedUrl = new URL(String(url));
+		} catch {
+			throw new TypeError(
+				`Failed to execute 'redirect' on 'Response': Invalid URL`,
+			);
+		}
+		if (![301, 302, 303, 307, 308].includes(status)) {
+			throw new RangeError(
+				`Failed to execute 'redirect' on 'Response': Invalid status code`,
+			);
+		}
+		return new Response(null, {
+			status,
+			headers: {
+				location: parsedUrl.href,
+			},
+		});
+	}
+
+	/**
+	 * Create a new JSON response.
+	 * @param {any} data - The data to include in the response body.
+	 * @param {ResponseInit} init - Initialization options for the response.
+	 * @returns {Response} - The new JSON response.
+	 */
+	static json(data: any, init: ResponseInit = {}): Response {
+		const headers = new Headers(init.headers);
+		if (!headers.has('content-type')) {
+			headers.set('content-type', 'application/json');
+		}
+		const json = encoder.encode(JSON.stringify(data));
+		headers.set('content-length', String(json.length));
+		return new Response(json, { ...init, headers });
+	}
+}
+def(Response);

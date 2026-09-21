@@ -1,0 +1,908 @@
+import type { PromiseState } from '@nx.js/inspect';
+import type { CanvasRenderingContext2D } from './canvas/canvas-rendering-context-2d';
+import type { ImageBitmap } from './canvas/image-bitmap';
+import type { WebGL2RenderingContext } from './canvas/webgl2-rendering-context';
+import type { OffscreenCanvas } from './canvas/offscreen-canvas';
+import type { OffscreenCanvasRenderingContext2D } from './canvas/offscreen-canvas-rendering-context-2d';
+import type { Crypto, CryptoKey } from './crypto';
+import type { DOMMatrix, DOMMatrixInit, DOMMatrixReadOnly } from './dommatrix';
+import type { DOMPoint, DOMPointInit } from './dompoint';
+import type { FontFace } from './font/font-face';
+import type { Image } from './image';
+import type {
+	Callback,
+	Keys,
+	Opaque,
+	RGBA,
+	VibrationValues,
+} from './internal';
+import type { BatteryManager } from './navigator/battery';
+import type { Gamepad, GamepadButton } from './navigator/gamepad';
+import type { VirtualKeyboard } from './navigator/virtual-keyboard';
+import type { Touch } from './polyfills/event';
+import type { URL, URLSearchParams } from './polyfills/url';
+import type { Screen } from './screen';
+import type {
+	Album,
+	AlbumFile,
+	Application,
+	FileSystem,
+	IRSensor,
+	MemoryUsage,
+	NetworkInfo,
+	Profile,
+	ProfileUid,
+	DirEntry,
+	ReadFileOptions,
+	SaveData,
+	SaveDataCreationInfo,
+	Service,
+	Stats,
+	Versions,
+} from './switch';
+import type { Server, TlsContextOpaque } from './tcp';
+import type { Algorithm, BufferSource } from './types';
+import type { DatagramSocket } from './udp';
+import type { Window } from './window';
+
+type ClassOf<T> = {
+	new (...args: any[]): T;
+};
+
+export type AudioContextHandle = Opaque<'AudioContextHandle'>;
+export type AudioNodeHandle = Opaque<'AudioNodeHandle'>;
+
+export interface BtleScanResult {
+	address: string;
+	name?: string;
+	/** Raw BtdrvBleScanResult bytes (only when requested; diagnostics). */
+	raw?: ArrayBuffer;
+}
+
+export interface BtleConnection {
+	handle: number;
+	address: string;
+}
+
+export interface BtleService {
+	uuid: string;
+	handle: number;
+	instanceId: number;
+	primary: boolean;
+}
+
+export interface BtleCharacteristic {
+	uuid: string;
+	handle: number;
+	instanceId: number;
+	properties: number;
+}
+
+export interface BtleDescriptor {
+	uuid: string;
+	handle: number;
+}
+
+export type BtleEvent =
+	| { type: 'scan' | 'connection' | 'discovery' | 'mtu' }
+	| {
+			type: 'gatt';
+			/** BtdrvBleEventType (8 = ClientNotify) */
+			event: number;
+			status: number;
+			connId: number;
+			op: number;
+			serviceUuid: string;
+			characteristicUuid: string;
+			descriptorUuid: string;
+			data: ArrayBuffer;
+	  };
+
+export type VideoHandle = Opaque<'VideoHandle'>;
+
+export interface VideoMediaTrack {
+	id: number;
+	language: string;
+	label: string;
+	codec: string;
+	supported: boolean;
+}
+
+export interface VideoMetadata {
+	width: number;
+	height: number;
+	duration: number;
+	hasAudio: boolean;
+	hasVideo: boolean;
+}
+
+export interface VideoPlaybackState {
+	decoder: 'software' | 'nvdec-pending' | 'nvdec';
+	audioTrack: number;
+	subtitleTrack: number;
+	trackError?: string;
+	currentTime: number;
+	ended: boolean;
+	seeking: boolean;
+	/** Number of decoded video frames waiting for presentation. */
+	buffered: number;
+	/** Total video frames presented so far. */
+	presentedFrames: number;
+	/** Frames skipped because a newer frame was already due. */
+	droppedFrames: number;
+	/** Sticky fatal decode error message (if any). */
+	error?: string;
+}
+type FileHandle = Opaque<'FileHandle'>;
+type CanvasGradientOpaque = Opaque<'CanvasGradientOpaque'>;
+type CompressHandle = Opaque<'CompressHandle'>;
+type DecompressHandle = Opaque<'DecompressHandle'>;
+type DecompressFileHandle = Opaque<'DecompressFileHandle'>;
+type SaveDataIterator = Opaque<'SaveDataIterator'>;
+type URLSearchParamsIterator = Opaque<'URLSearchParamsIterator'>;
+export type USBNativeDevice = Opaque<'USBNativeDevice'>;
+
+/** Effective socket (libnx SocketInitConfig) values, after nxjs.ini overrides. */
+export interface NxSocketConfig {
+	tcpTxBufSize: number;
+	tcpRxBufSize: number;
+	tcpTxBufMaxSize: number;
+	tcpRxBufMaxSize: number;
+	udpTxBufSize: number;
+	udpRxBufSize: number;
+	sbEfficiency: number;
+	numBsdSessions: number;
+	/** libnx BsdServiceType: 1=user, 2=system, 3=auto. */
+	serviceType: number;
+}
+
+/**
+ * Effective libuv worker thread pool settings (after `[threadpool]` overrides
+ * from `nxjs.ini` are clamped). The pool services every async native operation
+ * (fs, crypto, compression, image decode, dns, …). Defaults: 4 workers with
+ * 1 MiB stacks (Switch-appropriate; upstream libuv's 8 MiB stacks cannot be
+ * committed in applet mode).
+ */
+export interface NxThreadpoolConfig {
+	/** Number of worker threads. */
+	size: number;
+	/** Stack size per worker thread, in bytes. */
+	stackSize: number;
+}
+
+/**
+ * On-screen console styling from the `[console]` section of `nxjs.ini`. Only the
+ * keys present in the file are set. The global `console` seeds its options from
+ * this at startup; an explicit `console.options =` assignment overrides it. The
+ * shape matches the runtime's `TerminalOptions` (theme, fontSize, …).
+ */
+export interface NxConsoleConfig {
+	fontSize?: number;
+	lineHeight?: number;
+	scrollback?: number;
+	cursorStyle?: 'block' | 'underline' | 'bar';
+	cursorOpacity?: number;
+	/** Theme colors: `background`/`foreground`/`cursor` + the ANSI palette. */
+	theme?: Record<string, string>;
+}
+
+/** Effective application config (from `nxjs.ini`); values reflect post-clamp reality. */
+export interface NxConfig {
+	/** Whether V8 JIT is enabled (vs jitless interpreter). */
+	jit: boolean;
+	/**
+	 * Effective extra JIT code-arena headroom (MiB) reserved for WebAssembly
+	 * beyond V8's 64 MiB code-range floor. 0 means WASM is effectively
+	 * unavailable (no room for its code space) — opt in via `[v8]
+	 * code_headroom_mb` / `wasm = on`. Always 0 when `jit` is false.
+	 */
+	codeHeadroomMb: number;
+	/** Effective V8 max heap size in bytes (post-clamp; the value actually passed to V8). */
+	heapLimit: number;
+	/** Requested renderer mode. */
+	renderer: 'auto' | 'cpu' | 'gpu';
+	/** App-provided V8 flag string applied after the runtime defaults (empty if none). */
+	v8Flags: string;
+	/** Effective libnx socket configuration. */
+	socket: NxSocketConfig;
+	/** Effective libuv worker thread pool configuration. */
+	threadpool: NxThreadpoolConfig;
+	/** On-screen console styling from the `[console]` section (empty if none). */
+	console: NxConsoleConfig;
+	/** Whether an `nxjs.ini` file was found and parsed. */
+	loaded: boolean;
+}
+
+export interface Init {
+	// account.c
+	accountInitialize(): () => void;
+	accountProfileInit(c: ClassOf<Profile>): void;
+	accountCurrentProfile(): Profile | null;
+	accountSelectProfile(): Profile | null;
+	accountProfileNew(uid: ProfileUid): Profile;
+	accountProfiles(): Profile[];
+
+	// album.c
+	capsaInitialize(): () => void;
+	albumInit(c: ClassOf<Album>): void;
+	albumFileInit(c: ClassOf<AlbumFile>): void;
+	albumFileList(album: Album): AlbumFile[];
+
+	// applet.c
+	appletIlluminance(): number;
+	appletGetAppletType(): number;
+	appletGetOperationMode(): number;
+	appletSetMediaPlaybackState(state: boolean): void;
+
+	// battery.c
+	batteryInit(): void;
+	batteryInitClass(c: ClassOf<BatteryManager>): void;
+	batteryExit(): void;
+
+	// canvas.c
+	canvasNew(width: number, height: number): Screen | OffscreenCanvas;
+	canvasToBuffer(
+		canvas: Screen | OffscreenCanvas,
+		type?: string,
+		quality?: number,
+	): Promise<ArrayBuffer>;
+	canvasInitClass(c: ClassOf<Screen | OffscreenCanvas>): void;
+	canvasContext2dNew(c: Screen): CanvasRenderingContext2D;
+	canvasContext2dNew(c: OffscreenCanvas): OffscreenCanvasRenderingContext2D;
+	canvasContext2dInitClass(
+		c: ClassOf<CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D>,
+	): void;
+	canvasContext2dGetImageData(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+		sx: number,
+		sy: number,
+		sw: number,
+		sh: number,
+	): ArrayBuffer;
+	canvasContext2dGetTransform(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+	): number[];
+	canvasContext2dGetFont(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+	): string;
+	canvasContext2dSetFont(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+		font: FontFace,
+		size: number,
+		fontString: string,
+	): number[];
+	canvasContext2dGetFillStyle(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+	): RGBA;
+	canvasContext2dSetFillStyle(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+		...rgba: RGBA
+	): number[];
+	canvasContext2dGetStrokeStyle(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+	): RGBA;
+	canvasContext2dSetStrokeStyle(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+		...rgba: RGBA
+	): number[];
+	canvasContext2dSetFillStyleGradient(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+		gradient: CanvasGradientOpaque,
+	): void;
+	canvasContext2dSetStrokeStyleGradient(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+		gradient: CanvasGradientOpaque,
+	): void;
+	canvasContext2dGetShadowColor(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+	): RGBA;
+	canvasContext2dSetShadowColor(
+		ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+		...rgba: RGBA
+	): void;
+	canvasGradientNewLinear(
+		x0: number,
+		y0: number,
+		x1: number,
+		y1: number,
+	): CanvasGradientOpaque;
+	canvasGradientNewRadial(
+		x0: number,
+		y0: number,
+		r0: number,
+		x1: number,
+		y1: number,
+		r1: number,
+	): CanvasGradientOpaque;
+	canvasGradientInitClass(c: any): void;
+	canvasGradientAddColorStop(
+		gradient: any,
+		offset: number,
+		r: number,
+		g: number,
+		b: number,
+		a: number,
+	): void;
+
+	// compression.c
+	compressNew(format: string): CompressHandle;
+	compressWrite(
+		handle: CompressHandle,
+		buf: BufferSource,
+	): Promise<ArrayBuffer>;
+	compressFlush(handle: CompressHandle): Promise<ArrayBuffer | null>;
+	decompressNew(format: string): DecompressHandle;
+	decompressWrite(
+		handle: DecompressHandle,
+		buf: BufferSource,
+	): Promise<ArrayBuffer>;
+	decompressFlush(handle: DecompressHandle): Promise<ArrayBuffer | null>;
+	/**
+	 * Fused file decompression: open `path` at `[start, end)` and decompress it
+	 * with `format`, reading + decompressing in one thread-pool dispatch per
+	 * {@link decompressFilePull | `decompressFilePull()`} call. Powers the
+	 * transparent fast path for `file.stream().pipeThrough(DecompressionStream)`.
+	 */
+	decompressFileNew(
+		format: string,
+		path: string,
+		start?: number,
+		end?: number,
+		/** Per-pull output capacity in bytes (clamped 256 KiB..8 MiB). Larger
+		 * means fewer thread-pool dispatches per MB of output. */
+		outCap?: number,
+	): DecompressFileHandle;
+	/** Pull the next decompressed chunk, or `null` at end of stream. */
+	decompressFilePull(
+		handle: DecompressFileHandle,
+	): Promise<ArrayBuffer | null>;
+
+	// crypto.c
+	cryptoKeyNew(
+		algorithm: Algorithm,
+		key: ArrayBuffer,
+		extractable: boolean,
+		keyUsages: KeyUsage[],
+	): CryptoKey<any>;
+	cryptoInit(c: ClassOf<Crypto>): void;
+	cryptoKeyInit(c: ClassOf<CryptoKey<any>>): void;
+	cryptoEncrypt(
+		algorithm: Algorithm,
+		key: CryptoKey<any>,
+		data: BufferSource,
+	): Promise<ArrayBuffer>;
+	cryptoDecrypt(
+		algorithm: Algorithm,
+		key: CryptoKey<any>,
+		data: BufferSource,
+	): Promise<ArrayBuffer>;
+	cryptoSign(
+		algorithm: Algorithm,
+		key: CryptoKey<any>,
+		data: BufferSource,
+	): Promise<ArrayBuffer>;
+	cryptoVerify(
+		algorithm: Algorithm,
+		key: CryptoKey<any>,
+		signature: BufferSource,
+		data: BufferSource,
+	): Promise<boolean>;
+	cryptoExportKey(format: string, key: CryptoKey<any>): ArrayBuffer;
+	cryptoGenerateKeyEc(namedCurve: string): [ArrayBuffer, ArrayBuffer];
+	cryptoKeyNewEcPrivate(
+		algorithm: any,
+		privateKey: ArrayBuffer,
+		publicKey: ArrayBuffer,
+		extractable: boolean,
+		usages: string[],
+	): any;
+	cryptoDeriveBits(
+		algorithm: any,
+		baseKey: CryptoKey<any>,
+		length: number,
+	): Promise<ArrayBuffer>;
+	cryptoDigest(algorithm: string, buf: BufferSource): Promise<ArrayBuffer>;
+	cryptoGenerateKeyRsa(
+		modulusLength: number,
+		publicExponent: number,
+	): Promise<ArrayBuffer[]>;
+	cryptoKeyNewRsa(
+		algoName: string,
+		hashName: string,
+		type: string,
+		n: ArrayBuffer,
+		e: ArrayBuffer,
+		d: ArrayBuffer | null,
+		p: ArrayBuffer | null,
+		q: ArrayBuffer | null,
+		extractable: boolean,
+		usages: string[],
+	): CryptoKey<any>;
+	cryptoRsaExportComponents(key: CryptoKey<any>): ArrayBuffer[];
+	cryptoExportKeyPkcs8(key: CryptoKey<any>): ArrayBuffer;
+	cryptoExportKeySpki(key: CryptoKey<any>): ArrayBuffer;
+	cryptoImportKeyPkcs8Spki(
+		format: string,
+		data: BufferSource,
+		algoName: string,
+		paramName: string,
+		extractable: boolean,
+		usages: string[],
+	): CryptoKey<any>;
+	cryptoEcExportPublicRaw(key: CryptoKey<any>): ArrayBuffer;
+	sha256Hex(str: string): string;
+
+	// dommatrix.c
+	dommatrixNew(values?: number[]): DOMMatrix | DOMMatrixReadOnly;
+	dommatrixFromMatrix(init?: DOMMatrixInit): DOMMatrix | DOMMatrixReadOnly;
+	dommatrixROInitClass(c: ClassOf<DOMMatrixReadOnly>): void;
+	dommatrixInitClass(c: ClassOf<DOMMatrix>): void;
+	dommatrixTransformPoint(m: DOMMatrixReadOnly, p: DOMPointInit): DOMPoint;
+
+	// dns.c
+	dnsResolve(hostname: string): Promise<string[]>;
+
+	// error.c
+	onError(fn: (err: any) => number): void;
+	onUnhandledRejection(
+		fn: (promise: Promise<unknown>, reason: any) => number,
+	): void;
+
+	// font.c
+	fontFaceNew(data: ArrayBuffer): FontFace;
+	getSystemFont(type: number): ArrayBuffer;
+
+	// fs.c
+	fclose(f: FileHandle): Promise<void>;
+	fopen(path: string, mode: string, startOffset?: number): Promise<FileHandle>;
+	fread(f: FileHandle, buf: ArrayBuffer): Promise<number | null>;
+	fwrite(f: FileHandle, data: ArrayBuffer): Promise<void>;
+	fsCreateBigFile(path: string): void;
+	mkdir(path: string, mode: number): Promise<number>;
+	mkdirSync(path: string, mode: number): number;
+	openDir(path: string): Promise<object>;
+	readDirNext(handle: object): Promise<DirEntry | null>;
+	closeDir(handle: object): Promise<void>;
+	readDirSync(path: string): string[] | null;
+	readFile(path: string, opts?: ReadFileOptions): Promise<ArrayBuffer | null>;
+	readFileSync(path: string, opts?: ReadFileOptions): ArrayBuffer | null;
+	remove(path: string): Promise<void>;
+	removeSync(path: string): void;
+	rename(path: string, dest: string): Promise<void>;
+	renameSync(path: string, dest: string): void;
+	stat(path: string): Promise<Stats | null>;
+	statSync(path: string): Stats | null;
+	writeFile(path: string, data: ArrayBuffer): Promise<void>;
+	writeFileSync(path: string, data: ArrayBuffer): void;
+	appendFileSync(path: string, data: ArrayBuffer): void;
+
+	// fsdev.c
+	fsInit(c: ClassOf<FileSystem>): void;
+	fsMount(fs: FileSystem, name: string): void;
+	fsOpenBis(id: number): FileSystem;
+	fsOpenSdmc(): FileSystem;
+	fsOpenWithId(
+		titleId: bigint,
+		type: number,
+		path: string,
+		attributes: number,
+	): FileSystem;
+	saveDataInit(c: ClassOf<SaveData>): void;
+	saveDataCreateSync(info: SaveDataCreationInfo, nacp?: ArrayBuffer): void;
+	saveDataMount(saveData: SaveData, name: string): void;
+	fsOpenSaveDataInfoReader(saveDataSpaceId: number): SaveDataIterator | null;
+	fsSaveDataInfoReaderNext(iterator: SaveDataIterator): SaveData | null;
+
+	// gamepad.c
+	gamepadInit(c: ClassOf<Gamepad>): void;
+	gamepadNew(index: number): Gamepad;
+	gamepadButtonInit(c: ClassOf<GamepadButton>): void;
+	gamepadButtonNew(gamepad: Gamepad, index: number): void;
+
+	// hidsys.c
+	/**
+	 * Non-blocking check of the OS controller connect/disconnect event.
+	 * Returns `true` when a controller was connected or disconnected since the
+	 * last call (and invalidates the cached `Gamepad.id` values), `false`
+	 * otherwise. Called once per frame to drive `gamepadconnected` /
+	 * `gamepaddisconnected` dispatch.
+	 */
+	gamepadConnectionChanged(): boolean;
+
+	// image.c
+	imageInit(c: ClassOf<Image | ImageBitmap>): void;
+	imageNew(width?: number, height?: number): Image | ImageBitmap;
+	imageDecode(img: Image | ImageBitmap, data: ArrayBuffer): Promise<void>;
+	imageClose(img: ImageBitmap): void;
+
+	// irs.c
+	irsInit(): () => void;
+	irsSensorNew(image: ImageBitmap, color: RGBA): IRSensor;
+	irsSensorStart(s: IRSensor): void;
+	irsSensorStop(s: IRSensor): void;
+	irsSensorUpdate(s: IRSensor): boolean;
+
+	// memory.c
+	memoryUsage(): MemoryUsage;
+
+	// main.c
+	argv: string[];
+	entrypoint: string;
+	/**
+	 * Source for `Application.self`: a `.nro` path for standalone/slim NRO apps,
+	 * or `null` for installed titles (fat/slim NSP) — in which case
+	 * `nsAppNew(null)` resolves via the running process's ProgramId. Identifies
+	 * the launched app, not the shared runtime NRO.
+	 */
+	selfNroPath: string | null;
+	version: Versions;
+	/** Configured bsdsocket TCP receive buffer size (bytes) for this memory regime. */
+	tcpRxBufSize: number;
+	/** Effective application config parsed from `nxjs.ini` (next to the entrypoint). */
+	config: NxConfig;
+	exit(): never;
+	queueMicrotask(callback: () => void): void;
+	cwd(): string;
+	chdir(dir: string): void;
+	print(v: string): void;
+	printErr(v: string): void;
+	getInternalPromiseState(p: Promise<unknown>): [PromiseState, unknown];
+	getenv(name: string): string | undefined;
+	setenv(name: string, value: string): void;
+	unsetenv(name: string): void;
+	envToObject(): Record<string, string>;
+	onFrame(fn: (plusDown: boolean) => void): void;
+	onExit(fn: () => void): void;
+	framebufferInit(screen: Screen): void;
+	hidInitializeTouchScreen(): void;
+	hidGetTouchScreenStates(): Touch[] | undefined;
+	hidInitializeKeyboard(): void;
+	hidInitializeVibrationDevices(): void;
+	hidGetKeyboardStates(): Keys;
+	hidSendVibrationValues(v: VibrationValues): void;
+
+	// webgl.c
+	/**
+	 * Initializes EGL + an OpenGL ES 3 context on the screen. Returns the
+	 * native context carrier object, or `undefined` when GL init fails.
+	 */
+	webglContextNew(screen: Screen): WebGL2RenderingContext | undefined;
+	webglInitClass(
+		c: ClassOf<WebGL2RenderingContext>,
+		classes: Record<string, unknown>,
+	): void;
+
+	// nifm.c
+	nifmInitialize(): () => void;
+	networkInfo(): NetworkInfo;
+
+	// ns.c
+	nsInitialize(): () => void;
+	nsAppInit(c: ClassOf<Application>): void;
+	nsAppNew(id: string | bigint | ArrayBuffer | null): Application;
+	nsAppNext(index: number): bigint | null;
+
+	// service.c
+	serviceInit(c: ClassOf<Service>): () => void;
+	serviceNew(name?: string): Service;
+
+	// software-keyboard.c
+	swkbdCreate(fns: {
+		onCancel: (this: VirtualKeyboard) => void;
+		onChange: (
+			this: VirtualKeyboard,
+			str: string,
+			cursorPos: number,
+			dicStartCursorPos: number,
+			dicEndCursorPos: number,
+		) => void;
+		onSubmit: (this: VirtualKeyboard, str: string) => void;
+		onCursorMove: (
+			this: VirtualKeyboard,
+			str: string,
+			cursorPos: number,
+		) => void;
+	}): VirtualKeyboard;
+	swkbdSetCursorPos(s: VirtualKeyboard, cursorPos: number): void;
+	swkbdSetInputText(s: VirtualKeyboard, value: string): void;
+	swkbdShow(s: VirtualKeyboard): [number, number, number, number];
+	swkbdHide(s: VirtualKeyboard): void;
+	swkbdUpdate(this: VirtualKeyboard): void;
+
+	// web.c
+	webAppletNew(): any;
+	webAppletStart(applet: any, url: string, options: Record<string, any>): void;
+	webAppletAppear(applet: any): boolean;
+	webAppletSendMessage(applet: any, msg: string): boolean;
+	webAppletPollMessages(applet: any): string[];
+	webAppletRequestExit(applet: any): void;
+	webAppletClose(applet: any): void;
+	webAppletIsRunning(applet: any): boolean;
+	webAppletGetMode(applet: any): string;
+
+	// tcp.c
+	/** Returns the connecting fd while the attempt is in flight (abort it with `close(fd)`), or -1 if it settled synchronously. */
+	connect(cb: Callback<number>, ip: string, port: number): number;
+	write(cb: Callback<number>, fd: number, data: BufferSource): void;
+	read(cb: Callback<number>, fd: number, buffer: ArrayBuffer): void;
+	close(fd: number): void;
+	tcpServerInit(c: any): void;
+	tcpServerNew(
+		ip: string,
+		port: number,
+		onAccept: (fd: number) => void,
+	): Server;
+
+	// udp.c
+	udpInit(c: any): void;
+	udpNew(
+		ip: string,
+		port: number,
+		onRecv: (
+			err: Error | null,
+			data?: ArrayBuffer,
+			remoteIp?: string,
+			remotePort?: number,
+		) => void,
+	): DatagramSocket;
+	udpSend(
+		cb: Callback<number>,
+		fd: number,
+		data: ArrayBuffer,
+		ip: string,
+		port: number,
+	): void;
+
+	// tls.c
+	tlsHandshake(
+		cb: Callback<TlsContextOpaque>,
+		fd: number,
+		hostname: string,
+		rejectUnauthorized: boolean,
+	): void;
+	tlsWrite(
+		cb: Callback<number>,
+		ctx: TlsContextOpaque,
+		data: ArrayBuffer,
+	): void;
+	tlsRead(
+		cb: Callback<number>,
+		ctx: TlsContextOpaque,
+		buffer: ArrayBuffer,
+	): void;
+	tlsClose(ctx: TlsContextOpaque): void;
+
+	// url.c
+	urlInit(c: ClassOf<URL>): void;
+	urlNew(url: string | URL, base?: string | URL): URL;
+	urlSearchInit(c: ClassOf<URLSearchParams>): void;
+	urlSearchNew(input: string, url?: URL): URLSearchParams;
+	urlSearchIterator(
+		params: URLSearchParams,
+		type: number,
+	): URLSearchParamsIterator;
+	urlSearchIteratorNext(it: URLSearchParamsIterator): any;
+
+	// audio.cc — Web Audio API
+	audioContextNew(sampleRate: number, offline: boolean): AudioContextHandle;
+	audioContextClose(ctx: AudioContextHandle): void;
+	audioContextSuspend(ctx: AudioContextHandle): void;
+	audioContextResume(ctx: AudioContextHandle): void;
+	audioContextCurrentTime(ctx: AudioContextHandle): number;
+	audioContextDestination(ctx: AudioContextHandle): AudioNodeHandle;
+	audioNodeNew(ctx: AudioContextHandle, type: number): AudioNodeHandle;
+	audioNodeConnect(src: AudioNodeHandle, dst: AudioNodeHandle): void;
+	audioNodeDisconnect(src: AudioNodeHandle, dst?: AudioNodeHandle): void;
+	audioParamValue(node: AudioNodeHandle, index: number): number;
+	audioParamSetValue(node: AudioNodeHandle, index: number, value: number): void;
+	audioParamSchedule(
+		node: AudioNodeHandle,
+		index: number,
+		type: number,
+		time: number,
+		value: number,
+		timeConstant: number,
+	): void;
+	audioParamSetValueCurve(
+		node: AudioNodeHandle,
+		index: number,
+		curve: Float32Array,
+		startTime: number,
+		duration: number,
+	): void;
+	audioParamCancel(node: AudioNodeHandle, index: number, time: number): void;
+	audioSourceSetBuffer(
+		node: AudioNodeHandle,
+		channels: Float32Array[],
+		length: number,
+		sampleRate: number,
+	): void;
+	audioSourceStart(
+		node: AudioNodeHandle,
+		when: number,
+		offset: number,
+		duration: number,
+	): void;
+	audioSourceStop(node: AudioNodeHandle, when: number): void;
+	audioSourceSetLoop(
+		node: AudioNodeHandle,
+		loop: boolean,
+		loopStart: number,
+		loopEnd: number,
+	): void;
+	audioSourceState(node: AudioNodeHandle): number;
+	audioDecode(buffer: ArrayBuffer): Promise<{
+		channelData: ArrayBuffer[];
+		length: number;
+		sampleRate: number;
+	}>;
+	audioOfflineRender(
+		ctx: AudioContextHandle,
+		numberOfChannels: number,
+		length: number,
+	): Promise<ArrayBuffer[]>;
+
+	// bluetooth.cc — Web Bluetooth (BLE GATT client over btm.u + bt)
+	btleInit(): void;
+	btleExit(): void;
+	/**
+	 * With `serviceUuid`: a "smart device" scan matching devices that
+	 * advertise that service UUID. With `companyId` (+ up to 6 pattern
+	 * bytes): a "general" scan with a custom manufacturer-data filter.
+	 * Without either: the "general" scan (Nintendo accessory filter).
+	 */
+	btleScanStart(
+		serviceUuid?: string | null,
+		companyId?: number | null,
+		pattern?: ArrayBuffer | null,
+	): void;
+	btleScanStop(): void;
+	btleScanResults(includeRaw?: boolean): BtleScanResult[];
+	btleConnect(address: string): void;
+	btleDisconnect(handle: number): void;
+	btleConnections(): BtleConnection[];
+	btleGetServices(conn: number): BtleService[];
+	btleGetCharacteristics(
+		conn: number,
+		serviceHandle: number,
+	): BtleCharacteristic[];
+	btleGetDescriptors(conn: number, charHandle: number): BtleDescriptor[];
+	btleRead(
+		conn: number,
+		primary: boolean,
+		serviceUuid: string,
+		serviceInstance: number,
+		charUuid: string,
+		charInstance: number,
+	): void;
+	btleWrite(
+		conn: number,
+		primary: boolean,
+		serviceUuid: string,
+		serviceInstance: number,
+		charUuid: string,
+		charInstance: number,
+		data: ArrayBuffer,
+		withResponse: boolean,
+	): void;
+	btleWriteDescriptor(
+		conn: number,
+		primary: boolean,
+		serviceUuid: string,
+		serviceInstance: number,
+		charUuid: string,
+		charInstance: number,
+		descUuid: string,
+		descInstance: number,
+		data: ArrayBuffer,
+	): void;
+	btleNotify(
+		conn: number,
+		primary: boolean,
+		serviceUuid: string,
+		serviceInstance: number,
+		charUuid: string,
+		charInstance: number,
+		enable: boolean,
+	): void;
+	btlePollEvents(): BtleEvent[];
+	/**
+	 * Unfiltered btdrv-level scan (no result delivery) used to prime the
+	 * Bluetooth stack's device cache before connecting by explicit address.
+	 */
+	btleRawScanStart(): void;
+	btleRawScanStop(): void;
+	/** Register/unregister a BLE GATT data path for a service UUID. */
+	btleRegisterDataPath(uuid: string, register: boolean): void;
+	/** Request an ATT MTU for the connection (browsers negotiate ~517). */
+	btleConfigureMtu(conn: number, mtu: number): void;
+	btleGetMtu(conn: number): number;
+
+	// usb.cc — WebUSB over libnx usb:hs (USB host mode)
+	usbInit(): void;
+	usbExit(): void;
+	usbGetDevices(filter?: {
+		vendorId?: number;
+		productId?: number;
+		classCode?: number;
+		subclassCode?: number;
+		protocolCode?: number;
+		interfaceClass?: number;
+		interfaceSubclass?: number;
+		interfaceProtocol?: number;
+	}): USBNativeDevice[];
+	usbDeviceOpen(device: USBNativeDevice): void;
+	usbDeviceClose(device: USBNativeDevice): void;
+	usbClaimInterface(device: USBNativeDevice, interfaceNumber: number): void;
+	usbTransferIn(
+		device: USBNativeDevice,
+		endpointNumber: number,
+		length: number,
+	): ArrayBuffer;
+	usbTransferOut(
+		device: USBNativeDevice,
+		endpointNumber: number,
+		data: BufferSource,
+	): number;
+	usbControlTransferIn(
+		device: USBNativeDevice,
+		setup: {
+			requestType: string;
+			recipient: string;
+			request: number;
+			value: number;
+			index: number;
+		},
+		length: number,
+	): ArrayBuffer;
+	usbResetDevice(device: USBNativeDevice): void;
+
+	// video.cc — Video element (ffmpeg media pipeline)
+	videoNew(): VideoHandle;
+	videoSetRenderSize(video: VideoHandle, maxWidth: number, maxHeight: number): void;
+	videoFrameStats(video: VideoHandle): { width: number; height: number; transferMs: number; convertMs: number };
+	videoLoad(
+		video: VideoHandle,
+		path: string | null,
+		buffer: ArrayBuffer | null,
+	): Promise<VideoMetadata>;
+	videoPlay(video: VideoHandle): void;
+	videoPause(video: VideoHandle): void;
+	videoSeek(video: VideoHandle, seconds: number): void;
+	videoTracks(video: VideoHandle, subtitle: boolean): VideoMediaTrack[];
+	videoSelectTrack(video: VideoHandle, id: number, subtitle: boolean): void;
+	videoSubtitleText(video: VideoHandle, seconds: number): string;
+	videoSetLoop(video: VideoHandle, loop: boolean): void;
+	videoTick(video: VideoHandle): boolean;
+	videoState(video: VideoHandle): VideoPlaybackState;
+	videoCreateAudioNode(
+		video: VideoHandle,
+		ctx: AudioContextHandle,
+	): AudioNodeHandle | null;
+	videoClose(video: VideoHandle): void;
+	videoReset(video: VideoHandle): void;
+	// media-source.cc — in-process byte source for Video (Switch.MediaSource)
+	mediaSourceNew(size: number): number;
+	mediaSourceProvide(id: number, offset: number, data: BufferSource): void;
+	mediaSourceWanted(id: number): number;
+	mediaSourcePosition(id: number): number;
+	mediaSourceBuffered(id: number, offset: number): number;
+	mediaSourceDiscardBefore(id: number, offset: number): void;
+	mediaSourceClose(id: number): void;
+	mediaSourceRetain(id: number, start: number, end: number, prefixEnd?: number): void;
+	mediaSourceStored(id: number): number;
+
+	// (Uint8Array base64/hex methods are provided natively by V8 — no binding.)
+
+	// window.c
+	windowInit(c: Window): void;
+
+	// path2d.c — Path2D backed by a native SkPath (user space). The methods
+	// are installed on the prototype by path2dInitClass; only the constructor
+	// backing + class installer are exposed on `$`.
+	path2dNew(path?: unknown): unknown;
+	path2dInitClass(Path2D: Function): void;
+}
+
+export const $: Init = (globalThis as any).$;
+delete (globalThis as any).$;

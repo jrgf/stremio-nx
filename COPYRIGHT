@@ -1,0 +1,19 @@
+Stremio NX
+Copyright (C) 2026 jrgf
+
+This project's original source code is free software: you can redistribute it
+and/or modify it under the terms of the GNU General Public License as published
+by the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See LICENSE for the GNU General Public License.
+
+Third-party code and assets retain their original copyrights and licenses.
+In particular, runtime/nxjs is derived from Nathan Rajlich's MIT-licensed nx.js.
+See runtime/nxjs/LICENSE, THIRD_PARTY_NOTICES.txt and LICENSE_REVIEW.md.
+
+The generated icon and logo in assets/ are included under the same project
+license to the extent rights are held by the project. No rights in third-party
+trademarks are granted. This is an independent, unofficial project.

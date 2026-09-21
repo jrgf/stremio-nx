@@ -1,0 +1,479 @@
+import { dataUriToBuffer } from 'data-uri-to-buffer';
+import {
+	type CompressionFormat,
+	DecompressionStream,
+} from '../compression-streams';
+import { DOMException } from '../dom-exception';
+import { readFile } from '../fs';
+import { INTERNAL_SYMBOL } from '../internal';
+import { navigator } from '../navigator';
+import { decoder } from '../polyfills/text-decoder';
+import { encoder } from '../polyfills/text-encoder';
+import { objectUrls, URL } from '../polyfills/url';
+import { connect, Socket } from '../tcp';
+import { def } from '../utils';
+import { Headers } from './headers';
+import { Request, type RequestInit } from './request';
+import { Response } from './response';
+
+function indexOfEol(arr: ArrayLike<number>, offset: number): number {
+	for (let i = offset; i < arr.length - 1; i++) {
+		if (arr[i] === 13 && arr[i + 1] === 10) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+function concat(a: Uint8Array, b: Uint8Array) {
+	const c = new Uint8Array(a.length + b.length);
+	c.set(a, 0);
+	c.set(b, a.length);
+	return c;
+}
+
+async function* headersIterator(
+	reader: ReadableStreamDefaultReader<Uint8Array>,
+): AsyncGenerator<{ line: string } | { line: null; leftover: Uint8Array }> {
+	let leftover: Uint8Array | null = null;
+	let headerBytes = 0;
+	while (true) {
+		const next = await reader.read();
+		if (next.done) throw new Error('Stream closed before end of headers');
+		const chunk: Uint8Array = leftover
+			? concat(leftover, next.value)
+			: next.value;
+		let pos = 0;
+		while (true) {
+			const eol = indexOfEol(chunk, pos);
+			if (eol === -1) {
+				leftover = chunk.slice(pos);
+				if (leftover.length > 8192) throw new Error('HTTP header line too long');
+				break;
+			}
+			headerBytes += eol - pos + 2;
+			if (eol - pos > 8192 || headerBytes > 65536) throw new Error('HTTP headers too large');
+			const line = decoder.decode(chunk.slice(pos, eol));
+			pos = eol + 2;
+			if (line) {
+				yield { line };
+			} else {
+				// end of headers
+				leftover = chunk.slice(pos);
+				yield { line: null, leftover };
+				reader.releaseLock();
+				return;
+			}
+		}
+	}
+}
+
+function createChunkedParseStream() {
+	let remaining = 0;
+	let line = '';
+	let delimiter = 0;
+	let ended = false;
+	return new TransformStream<Uint8Array, Uint8Array>({
+		transform(chunk, controller) {
+			let pos = 0;
+			while (pos < chunk.length) {
+				if (remaining) {
+					const n = Math.min(remaining, chunk.length - pos);
+					controller.enqueue(chunk.subarray(pos, pos + n));
+					pos += n;
+					remaining -= n;
+					if (!remaining) delimiter = 2;
+					continue;
+				}
+				if (delimiter) {
+					if (chunk[pos++] !== (delimiter === 2 ? 13 : 10)) throw new Error('Invalid HTTP chunk delimiter');
+					delimiter--;
+					continue;
+				}
+				line += String.fromCharCode(chunk[pos++]);
+				if (line.length > 8192) throw new Error('HTTP chunk header too long');
+				if (!line.endsWith('\r\n')) continue;
+				const match = /^([0-9a-f]+)(?:;[^\r\n]*)?\r\n$/i.exec(line);
+				if (!match) throw new Error('Invalid HTTP chunk size');
+				remaining = parseInt(match[1], 16);
+				if (!Number.isSafeInteger(remaining)) throw new Error('HTTP chunk too large');
+				line = '';
+				if (remaining === 0) { ended = true; controller.terminate(); return; }
+			}
+		},
+		flush() { if (!ended) throw new Error('Truncated chunked HTTP response'); },
+	});
+}
+
+function createContentLengthStream(contentLength: number) {
+	let bytesRead = 0;
+	return new TransformStream<Uint8Array, Uint8Array>({
+		transform(chunk, controller) {
+			if (bytesRead + chunk.byteLength < contentLength) {
+				controller.enqueue(chunk);
+				bytesRead += chunk.byteLength;
+			} else {
+				controller.enqueue(chunk.subarray(0, contentLength - bytesRead));
+				controller.terminate();
+			}
+		},
+	});
+}
+
+// List of supported content encodings.
+// These values must be accepted by the `DecompressionStream` class.
+const ACCEPT_ENCODINGS = new Set(['zstd', 'gzip', 'deflate']);
+const ACCEPT_ENCODING_HEADER = [...ACCEPT_ENCODINGS].join(', ');
+
+const MAX_REDIRECTS = 20;
+
+function isSameOrigin(a: URL, b: URL): boolean {
+	return (
+		a.protocol === b.protocol && a.hostname === b.hostname && a.port === b.port
+	);
+}
+
+async function fetchHttp(
+	req: Request,
+	url: URL,
+	redirectCount = 0,
+	bodyBytes?: Uint8Array | null,
+): Promise<Response> {
+	if (redirectCount > MAX_REDIRECTS) {
+		throw new TypeError('Failed to fetch: too many redirects');
+	}
+
+	const isHttps = url.protocol === 'https:';
+	const { hostname } = url;
+	const port = +url.port || (isHttps ? 443 : 80);
+	const hasContentLength = req.headers.has('content-length');
+	const socket = new Socket(
+		// @ts-expect-error Internal constructor
+		INTERNAL_SYMBOL,
+		{ hostname, port },
+		{ secureTransport: isHttps ? 'on' : 'off', connect },
+	);
+
+	// Wire AbortSignal to socket — propagate AbortError so pending I/O rejects
+	if (req.signal) {
+		if (req.signal.aborted) {
+			socket.close();
+			throw new DOMException('The operation was aborted.', 'AbortError');
+		}
+		const abort = () => {
+				const err =
+					req.signal.reason ??
+					new DOMException('The operation was aborted.', 'AbortError');
+				void socket.readable.cancel(err).catch(() => {});
+				void socket.writable.abort(err).catch(() => {});
+				socket.close();
+		};
+		req.signal.addEventListener('abort', abort, { once: true });
+		const removeAbort = () => req.signal.removeEventListener('abort', abort);
+		void socket.closed.then(removeAbort, removeAbort);
+	}
+
+	try {
+	if (!req.headers.has('host')) {
+		req.headers.set('host', url.host);
+	}
+	if (!req.headers.has('user-agent')) {
+		req.headers.set('user-agent', navigator.userAgent);
+	}
+	if (!req.headers.has('accept')) {
+		req.headers.set('accept', '*/*');
+	}
+
+	// Enable response compression by default.
+	// To opt-out, set `accept-encoding` to "identity".
+	// https://developer.mozilla.org/docs/Web/HTTP/Headers/Accept-Encoding
+	if (!req.headers.has('accept-encoding')) {
+		req.headers.set('accept-encoding', ACCEPT_ENCODING_HEADER);
+	}
+
+	if (!req.body || hasContentLength) {
+		req.headers.set('connection', 'close');
+	} else {
+		req.headers.set('connection', 'keep-alive');
+		req.headers.set('transfer-encoding', 'chunked');
+	}
+
+	const headerParts = [`${req.method} ${url.pathname}${url.search} HTTP/1.1`];
+	for (const [name, value] of req.headers) {
+		headerParts.push(`${name}: ${value}`);
+	}
+	headerParts.push('', '');
+	const header = headerParts.join('\r\n');
+	const w = socket.writable.getWriter();
+	await w.write(encoder.encode(header));
+
+	// Buffer the request body on the first call so it can be replayed on 307/308 redirects.
+	// On subsequent redirects, `bodyBytes` is passed in directly.
+	if (req.body && bodyBytes === undefined) {
+		const chunks: Uint8Array[] = [];
+		for await (const chunk of req.body) {
+			chunks.push(chunk);
+		}
+		const totalLength = chunks.reduce((sum, c) => sum + c.byteLength, 0);
+		bodyBytes = new Uint8Array(totalLength);
+		let offset = 0;
+		for (const c of chunks) {
+			bodyBytes.set(c, offset);
+			offset += c.byteLength;
+		}
+	}
+
+	// Flush the request body
+	if (bodyBytes && bodyBytes.byteLength > 0) {
+		if (hasContentLength) {
+			await w.write(bodyBytes);
+		} else {
+			await w.write(encoder.encode(`${bodyBytes.byteLength.toString(16)}\r\n`));
+			await w.write(bodyBytes);
+			await w.write(encoder.encode('\r\n0\r\n\r\n'));
+		}
+		w.releaseLock();
+	} else {
+		w.releaseLock();
+	}
+
+	const resHeaders = new Headers();
+	const r = socket.readable.getReader();
+
+	const hi = headersIterator(r);
+
+	// Parse response status line — use indexOf to preserve multi-word status text
+	const firstLine = await hi.next();
+	if (firstLine.done || !firstLine.value.line) {
+		throw new Error('Failed to read response header');
+	}
+	const statusLine = firstLine.value.line;
+	const firstSpace = statusLine.indexOf(' ');
+	if (firstSpace === -1) {
+		throw new Error(`Invalid HTTP response status line: ${statusLine}`);
+	}
+	const secondSpace = statusLine.indexOf(' ', firstSpace + 1);
+	const statusStr =
+		secondSpace === -1
+			? statusLine.slice(firstSpace + 1)
+			: statusLine.slice(firstSpace + 1, secondSpace);
+	const statusText =
+		secondSpace === -1 ? '' : statusLine.slice(secondSpace + 1);
+	const status = +statusStr;
+	if (isNaN(status)) {
+		throw new Error(`Invalid HTTP status code: ${statusStr}`);
+	}
+
+	// Parse response headers — use append() to support multi-value headers (e.g. Set-Cookie)
+	let leftover: Uint8Array | undefined;
+	for await (const v of hi) {
+		if (typeof v.line === 'string') {
+			const col = v.line.indexOf(':');
+			const name = v.line.slice(0, col);
+			const value = v.line.slice(col + 1).trim();
+			resHeaders.append(name, value);
+		} else {
+			leftover = v.leftover;
+		}
+	}
+
+	// Redirect
+	if (((status / 100) | 0) === 3) {
+		if (req.redirect === 'error') {
+			socket.close();
+			throw new TypeError(
+				`URI requested responds with a redirect, redirect mode is set to error: ${url}`,
+			);
+		}
+
+		if (req.redirect === 'follow') {
+			socket.close();
+			const loc = resHeaders.get('location');
+			if (!loc) {
+				throw new Error(
+					`No "Location" header in ${status} redirect from "${url}"`,
+				);
+			}
+			const redirectUrl = new URL(loc, req.url);
+			let method: RequestInit['method'] = 'GET';
+			let redirectBody: Uint8Array | null = null;
+			if (status === 307 || status === 308) {
+				method = req.method;
+				redirectBody = bodyBytes ?? null;
+			}
+
+			// Forward headers, but strip Authorization on cross-origin redirects
+			const redirectHeaders = new Headers(req.headers);
+			redirectHeaders.delete('host');
+			if (!isSameOrigin(url, redirectUrl)) {
+				redirectHeaders.delete('authorization');
+			}
+
+			const redirect = new Request(redirectUrl, {
+				method,
+				body: redirectBody,
+				headers: redirectHeaders,
+				redirect: req.redirect,
+				signal: req.signal,
+			});
+			const res = await fetchHttp(
+				redirect,
+				redirectUrl,
+				redirectCount + 1,
+				redirectBody,
+			);
+			res.redirected = true;
+			return res;
+		}
+
+		// For "manual", just continue with the regular logic
+	}
+
+	const resContentLength = resHeaders.get('content-length');
+	const resStream =
+		typeof resContentLength === 'string'
+			? createContentLengthStream(Number(resContentLength))
+			: resHeaders.get('transfer-encoding') === 'chunked'
+				? createChunkedParseStream()
+				: new TransformStream<Uint8Array, Uint8Array>();
+
+	if (leftover) {
+		const w = resStream.writable.getWriter();
+		void w.write(leftover).catch(() => {});
+		w.releaseLock();
+		leftover = undefined;
+	}
+	let resBody = socket.readable.pipeThrough(resStream);
+
+	// Decompress the response if the "content-encoding"
+	// header is set to a supported decompression format
+	const contentEncoding = resHeaders.get('content-encoding');
+	if (
+		typeof contentEncoding === 'string' &&
+		ACCEPT_ENCODINGS.has(contentEncoding)
+	) {
+		resBody = resBody.pipeThrough(
+			new DecompressionStream(contentEncoding as CompressionFormat),
+		);
+	}
+
+	const res = new Response(resBody, {
+		status,
+		statusText,
+		headers: resHeaders,
+	});
+	res.url = url.href;
+	return res;
+	} catch (error) {
+		socket.close();
+		throw error;
+	}
+}
+
+async function fetchBlob(req: Request, url: URL) {
+	if (req.method !== 'GET') {
+		throw new Error(
+			`GET method must be used when fetching "${url.protocol}" protocol (got "${req.method}")`,
+		);
+	}
+	const data = objectUrls.get(req.url);
+	if (!data) {
+		throw new Error(`Object URL "${req.url}" does not exist`);
+	}
+	return new Response(data, {
+		headers: {
+			'content-length': String(data.size),
+		},
+	});
+}
+
+async function fetchData(req: Request, url: URL) {
+	if (req.method !== 'GET') {
+		throw new Error(
+			`GET method must be used when fetching "${url.protocol}" protocol (got "${req.method}")`,
+		);
+	}
+	const parsed = dataUriToBuffer(url);
+	return new Response(parsed.buffer, {
+		headers: {
+			'content-length': String(parsed.buffer.byteLength),
+			'content-type': parsed.typeFull,
+		},
+	});
+}
+
+async function fetchFile(req: Request, url: URL) {
+	if (req.method !== 'GET') {
+		throw new Error(
+			`GET method must be used when fetching "${url.protocol}" protocol (got "${req.method}")`,
+		);
+	}
+	const path = url.protocol === 'file:' ? `sdmc:${url.pathname}` : url.href;
+	// TODO: Use streaming FS interface
+	const data = await readFile(path);
+	const headers = new Headers();
+	let status = 200;
+	if (data) {
+		headers.set('content-length', String(data.byteLength));
+	} else {
+		status = 404;
+	}
+	return new Response(data, { status, headers });
+}
+
+const fetchers = new Map<string, (req: Request, url: URL) => Promise<Response>>(
+	[
+		['http:', fetchHttp],
+		['https:', fetchHttp],
+		['blob:', fetchBlob],
+		['data:', fetchData],
+		['file:', fetchFile],
+		['sdmc:', fetchFile],
+		['romfs:', fetchFile],
+	],
+);
+
+/**
+ * The global `fetch()` method starts the process of fetching a resource from the network, returning a promise which is fulfilled once the response is available.
+ *
+ * ### Supported Protocols
+ *
+ * | Protocol | Description                                                                 |
+ * |----------|-----------------------------------------------------------------------------|
+ * | `http:`  | Fetch data from the network using the HTTP protocol                         |
+ * | `https:` | Fetch data from the network using the HTTPS protocol                        |
+ * | `blob:`  | Fetch data from a URL constructed by {@link URL.createObjectURL | `URL.createObjectURL()`}                |
+ * | `data:`  | Fetch data from a [Data URI](https://developer.mozilla.org/docs/Web/HTTP/Basics_of_HTTP/Data_URLs) (possibly base64-encoded)                        |
+ * | `sdmc:`  | Fetch data from a local file on the SD card                                 |
+ * | `romfs:` | Fetch data from the RomFS partition of the nx.js application                |
+ * | `file:`  | Same as `sdmc:`                                                             |
+ *
+ * @example
+ *
+ * ```typescript
+ * fetch('http://jsonip.com')
+ *   .then(res => res.json())
+ *   .then(data => {
+ *     console.log(`Current IP address: ${data.ip}`);
+ *   });
+ * ```
+ *
+ * @see https://developer.mozilla.org/docs/Web/API/fetch
+ */
+// NOTE: Intentionally not an async function so that `Object.prototype.toString` returns "[object Function]"
+export function fetch(
+	input: string | URL | Request,
+	init?: RequestInit,
+): Promise<Response> {
+	const req = new Request(input, init);
+	const url = new URL(req.url);
+	const fetcher = fetchers.get(url.protocol);
+	if (!fetcher) {
+		throw new Error(`scheme '${url.protocol.slice(0, -1)}' not supported`);
+	}
+	return fetcher(req, url).then((res) => {
+		if (!res.url) res.url = url.href;
+		return res;
+	});
+}
+def(fetch);

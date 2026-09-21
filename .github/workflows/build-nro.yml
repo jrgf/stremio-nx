@@ -4,12 +4,14 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  release:
+    types: [published]
 
 permissions:
   contents: read
 
 concurrency:
-  group: nro-${{ github.workflow }}-${{ github.ref }}
+  group: nro-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -58,3 +60,27 @@ jobs:
           path: artifacts/build.log
           if-no-files-found: ignore
           retention-days: 7
+
+  release:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      BUILD_RUN_ID: ${{ github.run_id }}
+      BUILD_ARTIFACT: stremio-nx-${{ github.sha }}
+    steps:
+      - name: Download verified build
+        run: gh run download "$BUILD_RUN_ID" --name "$BUILD_ARTIFACT" --dir artifacts
+      - name: Attach NRO and supporting files to GitHub release
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            artifacts/stremio-nx.nro artifacts/SHA256SUMS artifacts/build-info.json \
+            artifacts/LICENSE artifacts/COPYRIGHT artifacts/THIRD_PARTY_NOTICES.txt \
+            artifacts/LICENSE_REVIEW.md artifacts/project-source.tar.gz --clobber

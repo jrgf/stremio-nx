@@ -8,7 +8,7 @@ Browse catalogs and play torrents or direct HTTP links, including compatible deb
 
 ## Install
 
-1. Download the NRO artifact from a successful run of Actions > Build NRO.
+1. Download `stremio-nx.nro` from [Releases](https://github.com/jrgf/stremio-nx/releases), under Assets.
 2. Copy `stremio-nx.nro` to `/switch/` on your SD card.
 3. Open the Homebrew Menu through title override by holding R while launching a game, then start Stremio NX.
 

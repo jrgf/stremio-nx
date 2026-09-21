@@ -31,11 +31,17 @@ still needs testing on a Switch.
 
 ## GitHub Actions
 
-The Build NRO workflow runs on pushes, pull requests and manual dispatch. It
+The Build NRO workflow runs on pushes, pull requests, manual dispatch and published releases. It
 installs both lockfiles, runs the checks, cross-compiles and verifies the NRO.
 After a successful run, download `stremio-nx-<commit>` from the run's Artifacts
 section. The archive contains the NRO, checksum, build log, notices and project
-source. Artifacts expire after 14 days. The workflow does not publish releases.
+source. Artifacts expire after 14 days.
+
+To put the NRO on the GitHub Releases page, publish a release with a tag pointing
+to a commit that includes this workflow. Once the build succeeds, the NRO,
+checksum, build metadata, licenses and project source appear under Assets.
+Re-running that release build replaces attachments with the same names.
+Regular pushes and manual builds only produce Actions artifacts.
 
 Include `runtime/nxjs` source when committing. Its generated files and dependency
 directories are ignored. See its `README.stremio.md` for provenance.

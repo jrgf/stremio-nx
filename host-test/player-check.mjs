@@ -49,8 +49,10 @@ class Video {
 globalThis.Switch = { MediaSource: Source, memoryUsage: () => ({ usedHeapSize: 1, heapSizeLimit: 100 }) };
 globalThis.Video = Video; globalThis.fonts = new Set();
 globalThis.screen = { width: 1280, height: 720 };
+let deny = 0; // pending HTTP 429 answers
 globalThis.fetch = (url, init) => new Promise((resolve, reject) => {
 	const [start, end] = new Headers(init.headers).get('range').slice(6).split('-').map(Number);
+	if (deny > 0) { deny--; resolve(new Response(null, { status: 429 })); return; }
 	ranges.push({ start, end });
 	active++;
 	const finish = () => { active--; clearTimeout(timer); init.signal.removeEventListener('abort', abort); };
@@ -129,5 +131,29 @@ for (const transport of ['HTTP', 'torrent']) {
 		player.stop(); await until(() => active === 0);
 		assert.equal(source.closed, true); assert.equal(source.storedBytes, 0); assert.equal(video.src, ''); assert.equal(failure, undefined);
 		console.log(`PASS: ${transport} shared startup/read-ahead, starvation pause, refill hysteresis, user pause, EOF, prefix reuse, bounded cache and teardown`);
+	} finally { player.stop(); }
+}
+
+// HTTP lanes: a link delivering below twice the bitrate gains connections on distinct ranges; HTTP 429 drops back to one.
+{
+	delay = 5;
+	const input = new HttpStream({ url: 'https://video.example/movie' });
+	await input.open();
+	ranges.length = 0; delay = 20000; // nothing arrives: the player must not wait on one connection
+	let failure;
+	const logs = [];
+	const player = new MediaPlayer(input, { length, path: ['movie.mkv'] }, { log(line) { logs.push(line); }, onError(error) { failure = error; } });
+	player.start();
+	try {
+		const t0 = Date.now();
+		while (active < 3) { assert.ok(Date.now() - t0 < 6000, `starving playback must open up to three connections:\n${logs.slice(-3).join('\n')}`); await new Promise(resolve => setTimeout(resolve, 25)); }
+		assert.equal(new Set(ranges.map(r => r.start)).size, ranges.length, 'lanes fetch distinct ranges');
+		assert.ok(ranges.every(r => r.end < 48 * MiB), 'lanes stay inside the read-ahead goal');
+		deny = 1; delay = 5; input.cancel();
+		await until(() => logs.some(l => l.includes('HTTP 429')));
+		await until(() => logs.some(l => /lanes \d\/1 /.test(l)));
+		await until(() => source.buffered(0) >= 12 * MiB && active === 0);
+		assert.equal(failure, undefined);
+		console.log('PASS: HTTP lanes grow while starving and shrink to one after HTTP 429');
 	} finally { player.stop(); }
 }

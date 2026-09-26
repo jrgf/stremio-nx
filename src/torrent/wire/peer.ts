@@ -1,19 +1,23 @@
 /**
  * A single peer connection: TCP handshake (BEP 3), the extension handshake
- * (BEP 10) to discover ut_metadata, and a message read loop that surfaces
- * blocks and metadata to the engine via callbacks.
+ * (BEP 10) to discover ut_metadata and ut_pex, and a message read loop that
+ * surfaces blocks, metadata and exchanged peers to the engine via callbacks.
  */
 import { ByteReader } from '../../platform/stream';
 import type { Connection, Platform } from '../../platform/types';
-import { asDict, asInt, decode, encode, type Bencode } from '../bencode';
+import { asBytes, asDict, asInt, decode, encode, type Bencode } from '../bencode';
 import { Bitfield } from '../bitfield';
+import { parseCompactPeers } from '../tracker/peers';
 import type { PeerAddr } from '../types';
 import { decodeMessage, encodeHandshake, frame, messages, parseHandshake } from './messages';
 
 const EXT_HANDSHAKE_ID = 0;
 const OUR_UT_METADATA_ID = 1;
+/** Our id for peer exchange (BEP 11); we only consume `added` lists. */
+const OUR_UT_PEX_ID = 2;
 const MAX_MESSAGE = 1 << 20;
-const CONNECT_TIMEOUT_MS = 8000;
+/** Covers the TCP connect and the handshake reply; short so dead addresses cycle fast. */
+const CONNECT_TIMEOUT_MS = 5000;
 
 export interface PeerCallbacks {
 	onPiece?: (index: number, begin: number, block: Uint8Array) => void;
@@ -22,6 +26,8 @@ export interface PeerCallbacks {
 	onUnchoke?: () => void;
 	/** Raw ut_metadata message payload (bencode dict + trailing data). */
 	onMetadata?: (payload: Uint8Array) => void;
+	/** Peers this peer shared through ut_pex. */
+	onPex?: (added: PeerAddr[]) => void;
 	onExtendedHandshake?: () => void;
 	onClose?: (reason: string) => void;
 }
@@ -86,7 +92,7 @@ export class Peer {
 
 	async #sendExtendedHandshake(): Promise<void> {
 		const dict: Bencode = new Map<string, Bencode>([
-			['m', new Map<string, Bencode>([['ut_metadata', OUR_UT_METADATA_ID]])],
+			['m', new Map<string, Bencode>([['ut_metadata', OUR_UT_METADATA_ID], ['ut_pex', OUR_UT_PEX_ID]])],
 		]);
 		await this.send(messages.extended(EXT_HANDSHAKE_ID, encode(dict)));
 	}
@@ -146,6 +152,13 @@ export class Peer {
 			this.#cb.onExtendedHandshake?.();
 		} else if (extId === OUR_UT_METADATA_ID) {
 			this.#cb.onMetadata?.(payload);
+		} else if (extId === OUR_UT_PEX_ID) {
+			try {
+				const added = asDict(decode(payload)).get('added');
+				if (added !== undefined) this.#cb.onPex?.(parseCompactPeers(asBytes(added)));
+			} catch {
+				// Ignore a malformed pex message (IPv6-only lists carry no `added`).
+			}
 		}
 	}
 

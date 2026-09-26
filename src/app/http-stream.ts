@@ -3,18 +3,26 @@ import { httpUrl } from '../stremio/streams';
 
 export const HTTP_CHUNK = 8 * 1024 * 1024; // Range size amortizes connection/redirect costs.
 export const HTTP_FEED_CHUNK = 256 * 1024; // Bound each copy into the native playback cache.
+/**
+ * Max concurrent range requests. The runtime opens a fresh socket per fetch
+ * (`connection: close`), so one lane is bounded by a single TCP window per
+ * round trip; a starving player adds lanes (see player.ts).
+ */
+export const HTTP_LANES = 3;
 class RetryableReadError extends Error {}
 
-/** One bounded range request at a time; media never goes through Video's full-file fetch. */
+/** Bounded, concurrent range requests; media never goes through Video's full-file fetch. */
 export class HttpStream {
 	length = 0;
 	receivedBytes = 0;
 	requests = 0;
 	retries = 0;
+	/** HTTP 429 responses so far; the player drops to one lane when this grows. */
+	throttled = 0;
 	path: string[];
 	#url: URL;
 	#headers = new Headers();
-	#request?: AbortController;
+	#requests = new Set<AbortController>();
 	#closed = false;
 	#validator?: string;
 	#resolved?: { url: URL; headers: Headers };
@@ -36,21 +44,26 @@ export class HttpStream {
 	}
 
 	async open(): Promise<void> { await this.read(0, 1, () => {}); }
-	/** A seek cancels just the pending range; stop also prevents future reads. */
-	cancel(): void { this.#request?.abort(); }
+	/** Cancels every pending range; stop also prevents future reads. */
+	cancel(): void { for (const request of this.#requests) request.abort(); }
 	close(): void { this.#closed = true; this.cancel(); }
 
-	/** Feed a range progressively; only one small delivery block is accumulated. */
-	async read(start: number, count: number, provide: (offset: number, bytes: Uint8Array) => void): Promise<void> {
-		if (this.#closed) throw new DOMException('Stream stopped.', 'AbortError');
-		if (this.#request) throw new Error('A stream read is already pending.');
+	/**
+	 * Feed a range progressively; only one small delivery block is accumulated.
+	 * `signal` cancels just this range (a lane the player no longer needs).
+	 */
+	async read(start: number, count: number, provide: (offset: number, bytes: Uint8Array) => void, signal?: AbortSignal): Promise<void> {
+		if (this.#closed || signal?.aborted) throw new DOMException('Stream stopped.', 'AbortError');
+		if (this.#requests.size >= HTTP_LANES) throw new Error('Too many concurrent stream reads.');
 		if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(count) || count <= 0) throw new Error('Invalid stream range.');
 		if (this.length && start >= this.length) return;
 		count = Math.min(count, HTTP_CHUNK, this.length ? this.length - start : HTTP_CHUNK);
 		const end = start + count - 1;
 		if (!Number.isSafeInteger(end)) throw new Error('Invalid stream range.');
 		const controller = new AbortController();
-		this.#request = controller;
+		const abort = () => controller.abort();
+		signal?.addEventListener('abort', abort, { once: true });
+		this.#requests.add(controller);
 		let next = start;
 		try {
 			for (let attempt = 0; ; attempt++) {
@@ -77,7 +90,8 @@ export class HttpStream {
 			}
 		} finally {
 			controller.abort();
-			this.#request = undefined;
+			this.#requests.delete(controller);
+			signal?.removeEventListener('abort', abort);
 		}
 	}
 
@@ -122,6 +136,7 @@ export class HttpStream {
 				throw new RetryableReadError('The cached video link expired. Refreshing the source.');
 			}
 			if (response.status === 401 || response.status === 403) throw new Error('Video access was denied. Check the debrid account or refresh the stream list.');
+			if (response.status === 429) this.throttled++;
 			if ([408, 429, 500, 502, 503, 504].includes(response.status)) throw new RetryableReadError(`Video server temporarily unavailable (HTTP ${response.status}).`);
 			const type = response.headers.get('content-type') ?? '';
 			if (/mpegurl|dash\+xml/i.test(type)) throw new Error('HLS/DASH playlists are not supported yet. Choose a direct video file.');

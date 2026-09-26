@@ -7,11 +7,16 @@
 import { ByteReader } from '../src/platform/stream';
 import type { Connection } from '../src/platform/types';
 import { encode, type Bencode } from '../src/torrent/bencode';
+import type { PeerAddr } from '../src/torrent/types';
 import { decodeMessage, encodeHandshake, frame, messages, type PeerMessage } from '../src/torrent/wire/messages';
 
 export interface MockPeerOptions {
 	blockDelayMs?: number;
 	onMessage?: (msg: PeerMessage) => void;
+	/** Peers to share through ut_pex (our advertised id 2) right after the extended handshake. */
+	pex?: PeerAddr[];
+	/** A leecher that never unchokes us. */
+	neverUnchoke?: boolean;
 }
 
 export async function runMockPeer(
@@ -33,6 +38,11 @@ export async function runMockPeer(
 			['metadata_size', metadata.length],
 		]);
 		await writer.write(messages.extended(0, encode(extHandshake)));
+		if (opts.pex) {
+			const added = new Uint8Array(opts.pex.length * 6);
+			opts.pex.forEach((p, i) => { added.set([...p.ip.split('.').map(Number), p.port >> 8, p.port & 0xff], i * 6); });
+			await writer.write(messages.extended(2, encode(new Map<string, Bencode>([['added', added]]))));
+		}
 
 		for (;;) {
 			const lenBuf = await reader.readExact(4);
@@ -44,7 +54,7 @@ export async function runMockPeer(
 			const msg = decodeMessage(body);
 			opts.onMessage?.(msg);
 			if (msg.type === 'interested') {
-				await writer.write(messages.unchoke());
+				if (!opts.neverUnchoke) await writer.write(messages.unchoke());
 			} else if (msg.type === 'request') {
 				const reply = frame(7, concat(u32(msg.index), u32(msg.begin), block));
 				if (opts.blockDelayMs) setTimeout(() => void writer.write(reply).catch(() => {}), opts.blockDelayMs);

@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createServer } from 'node:http';
-import { HttpStream, HTTP_CHUNK, HTTP_FEED_CHUNK } from '../src/app/http-stream';
+import { HttpStream, HTTP_CHUNK, HTTP_FEED_CHUNK, HTTP_LANES } from '../src/app/http-stream';
 import { httpUrl, streamKind } from '../src/stremio/streams';
+
+async function until(cond: () => boolean): Promise<void> {
+	for (let i = 0; i < 400 && !cond(); i++) await new Promise(resolve => setTimeout(resolve, 5));
+	assert.ok(cond(), 'condition not reached');
+}
 
 async function readRange(input: HttpStream, start: number, count: number): Promise<Uint8Array> {
 	const chunks: Uint8Array[] = [];
@@ -186,6 +191,49 @@ test('HTTP retry backoff is cancellable and transient retries have a finite budg
 		calls = 0;
 		await assert.rejects(new HttpStream({ url: 'https://video.example/movie' }).open(), /HTTP 503/);
 		assert.equal(calls, 4);
+	} finally { globalThis.fetch = original; }
+});
+
+test('HTTP lanes run bounded concurrent ranges, cancel one by signal and all by cancel()', async () => {
+	const original = globalThis.fetch;
+	const size = 4 * HTTP_FEED_CHUNK;
+	let active = 0, peak = 0, deny = 0;
+	const releases: (() => void)[] = [];
+	globalThis.fetch = (_url, init) => new Promise((resolve, reject) => {
+		const [start, end] = new Headers(init?.headers).get('range')!.slice(6).split('-').map(Number);
+		if (deny > 0) { deny--; resolve(new Response(null, { status: 429 })); return; }
+		active++; peak = Math.max(peak, active);
+		// The stream aborts its controller after every range, so settle only once.
+		let done = false;
+		const settle = () => !done && (done = true) && --active >= 0;
+		init?.signal?.addEventListener('abort', () => { if (settle()) reject(new DOMException('aborted', 'AbortError')); }, { once: true });
+		releases.push(() => { if (settle()) resolve(new Response(Uint8Array.from({ length: end - start + 1 }, (_, i) => (start + i) % 251), { status: 206, headers: { 'Content-Range': `bytes ${start}-${end}/${size}` } })); });
+	});
+	try {
+		const input = new HttpStream({ url: 'https://video.example/movie' });
+		const got: number[] = [];
+		const lane = (start: number, signal?: AbortSignal) => input.read(start, HTTP_FEED_CHUNK, offset => { got.push(offset); }, signal);
+		const own = new AbortController();
+		const a = lane(0), b = lane(HTTP_FEED_CHUNK, own.signal), c = lane(2 * HTTP_FEED_CHUNK);
+		await until(() => releases.length === 3);
+		assert.equal(peak, HTTP_LANES);
+		await assert.rejects(lane(3 * HTTP_FEED_CHUNK), /Too many concurrent/);
+		own.abort();
+		await assert.rejects(b, { name: 'AbortError' });
+		releases[0](); releases[2]();
+		await Promise.all([a, c]);
+		assert.deepEqual(got.sort((x, y) => x - y), [0, 2 * HTTP_FEED_CHUNK]);
+		assert.equal(active, 0);
+		const d = lane(0), e = lane(HTTP_FEED_CHUNK);
+		await until(() => releases.length === 5);
+		input.cancel();
+		await assert.rejects(d, { name: 'AbortError' }); await assert.rejects(e, { name: 'AbortError' });
+		assert.equal(active, 0);
+		deny = 1;
+		const retried = lane(0);
+		await until(() => releases.length === 6); releases[5]();
+		await retried;
+		assert.equal(input.throttled, 1); assert.equal(input.retries, 1); assert.equal(active, 0);
 	} finally { globalThis.fetch = original; }
 });
 

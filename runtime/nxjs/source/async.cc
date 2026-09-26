@@ -23,20 +23,26 @@ extern "C" char *fake_heap_end;
 // After each async op completes, if the native heap is running low we fire a
 // V8 MemoryPressureNotification(kCritical) — which performs a blocking GC and
 // reclaims the unreferenced external backing stores — before returning to the
-// loop to start the next op. mallinfo() is cheap but not free, so only sample
-// it every few ops.
-static void nx_async_relieve_native_pressure(Isolate *iso) {
+// loop to start the next op.
+static void nx_async_relieve_native_pressure(Isolate *iso, uv_loop_t *loop) {
 	size_t total = (size_t)(fake_heap_end - fake_heap_start);
 	if (total == 0)
 		return;
-	// Sampled on EVERY async completion. mallinfo() is a cheap arena walk
-	// compared to the multi-MiB decompress/crypto/decode op that just ran, and
-	// the producers spike fast enough (a single op can allocate several MiB of
-	// result + intermediate buffers) that throttling the sample let transient
-	// spikes overshoot the ceiling between checks. So check each time.
+	// mallinfo() walks the allocator's free lists on the loop thread. On the
+	// ~170 MiB applet heap that is cheap, and the producers spike fast enough
+	// (a single op can allocate several MiB) that the sample must run on every
+	// completion while headroom is scarce. On the multi-GiB application heap
+	// the walk grows with fragmentation (tens of ms after an hour of media
+	// playback) and every socket/digest/file completion paid for it, so with
+	// plenty free the sample is repeated at most every 250 ms.
+	static uint64_t next_sample_ms = 0;
+	const uint64_t now_ms = uv_now(loop);
+	if (now_ms < next_sample_ms)
+		return;
 	struct mallinfo mi = mallinfo();
 	size_t used = (size_t)mi.uordblks;
 	size_t free_bytes = total > used ? total - used : 0;
+	next_sample_ms = free_bytes > 256ull * 1024 * 1024 ? now_ms + 250 : 0;
 	// Threshold: when under ~40 MiB of headroom remains, ask V8 to free now.
 	// Generous enough that even a burst of large allocations within one loop
 	// turn can't exhaust the heap before the next op's check fires. A no-op in
@@ -124,9 +130,8 @@ static void nx_uv_after_work_cb(uv_work_t *uvreq, int status) {
 	// If the native heap is running low (high-rate ArrayBuffer producers
 	// outpacing GC), ask V8 to reclaim unreferenced external backing stores
 	// now, before the loop starts the next op. See the helper above.
-	nx_async_relieve_native_pressure(iso);
+	nx_async_relieve_native_pressure(iso, ctx->loop);
 
-	(void)ctx;
 	(void)status;
 }
 

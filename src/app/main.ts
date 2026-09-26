@@ -39,25 +39,30 @@ const BUTTONS: Button[] = ['up', 'down', 'left', 'right', 'a', 'b', 'x', 'y', 'l
 const FULL_MEMORY_APPLET_TYPES = new Set([0, 4]);
 
 /** JS-thread timing probes from the render loop, read and reset by the stats line. */
-export const probes = { renderMaxMs: 0, renderGapMs: 0, gapAtMs: 0, heapBeforeGap: 0, heapAfterGap: 0, drawMaxMs: 0, logMaxMs: 0, lastHeap: 0, diag: 0 };
+export const probes = { renderMaxMs: 0, renderGapMs: 0, gapAtMs: 0, drawMaxMs: 0, logMaxMs: 0, diag: 0 };
 
 // Log to the console canvas during boot and to the SD card always. The SD
 // write is async and coalesced: a synchronous write stalled the JS thread,
 // which also pumps video frames.
 const LOG_DIR = 'sdmc:/switch/stremio-nx';
 const LOG_PATH = `${LOG_DIR}/torrent-log.txt`;
+/** Every flush rewrites the whole file, so periodic stats lines are batched. */
+const LOG_FLUSH_MS = 5000;
 const logLines: string[] = [];
 let consoleHidden = false;
 let logDirty = false;
 let logFlushing = false;
-function log(msg: string): void {
+let logTimer: ReturnType<typeof setTimeout> | undefined;
+/** `lazy` lines (per-second stats) reach the SD card within LOG_FLUSH_MS; events and errors immediately. */
+function log(msg: string, lazy = false): void {
 	const start = performance.now();
 	if (!consoleHidden) console.log(msg);
 	logLines.push(msg);
 	// Retain the launch header and the latest diagnostics, bounded for long sessions.
 	if (logLines.length > 2048) logLines.splice(1, logLines.length - 2048);
 	logDirty = true;
-	void flushLog();
+	if (!lazy) void flushLog();
+	else if (!logTimer) logTimer = setTimeout(() => { logTimer = undefined; void flushLog(); }, LOG_FLUSH_MS);
 	probes.logMaxMs = Math.max(probes.logMaxMs, performance.now() - start);
 }
 async function flushLog(): Promise<void> {
@@ -171,13 +176,11 @@ function startPresenting(state: AppState): void {
 
 	const render = () => {
 		const now = performance.now();
+		// No memory sampling here: Switch.memoryUsage() walks the native heap
+		// (10-30 ms) and would turn one late frame into two.
 		if (now - lastRender > probes.renderGapMs) {
 			probes.renderGapMs = now - lastRender;
 			probes.gapAtMs = now;
-			if (probes.renderGapMs > 42) {
-				probes.heapBeforeGap = probes.lastHeap;
-				probes.heapAfterGap = Switch.memoryUsage().usedHeapSize;
-			}
 		}
 		lastRender = now;
 		const { ui, player } = state;
@@ -250,13 +253,14 @@ async function main(): Promise<void> {
 	}
 	await Switch.mkdir(LOG_DIR).catch(() => undefined);
 	Switch.setMediaPlaybackState(true); // keep the screen awake
-	log(`stremio-nx build vod-buffer-20260920 | device ip ${Switch.networkInfo().ip} | canvas ${screen.width}x${screen.height}`);
+	log(`stremio-nx build streaming-opt-20260926 | device ip ${Switch.networkInfo().ip} | canvas ${screen.width}x${screen.height}`);
 
 	const state: AppState = { keyboardOpen: false, showStats: false, diag: 0 };
 	startPresenting(state);
 
 	// 1. Loopback control server the core's StreamingServer model talks to.
-	const sessions = new TorrentSessions(nxPlatform, { log, defaultTrackers: DEFAULT_TRACKERS, maxPeers: 20 });
+	// 30 peers + 16 pending connects + servers/DHT stay under the ~59-socket pool.
+	const sessions = new TorrentSessions(nxPlatform, { log, defaultTrackers: DEFAULT_TRACKERS, maxPeers: 30 });
 	const handler = createControlHandler({
 		baseUrl: CONTROL_BASE,
 		localIp: () => Switch.networkInfo().ip,

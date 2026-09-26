@@ -61,3 +61,43 @@ test('a block arriving from one peer is cancelled at the others racing it', asyn
 		slow.close();
 	}
 });
+
+test('peers shared through ut_pex are connected', async () => {
+	const { info, data } = makeTorrent(1, BLOCK_SIZE, BLOCK_SIZE);
+	const seen: string[] = [];
+	const sharer = nodePlatform.listen(18497, (conn) => void runMockPeer(conn, info.infoHash.bytes, data, undefined, { pex: [{ ip: '127.0.0.1', port: 18498 }] }), '127.0.0.1');
+	const shared = nodePlatform.listen(18498, (conn) => void runMockPeer(conn, info.infoHash.bytes, data, undefined, { onMessage: (m) => seen.push(m.type) }), '127.0.0.1');
+	const engine = new TorrentEngine(nodePlatform, { info, maxPeers: 2 });
+	try {
+		await engine.prepare({ infoHash: info.infoHash, announce: [], fileIdx: null });
+		engine.addPeers([{ ip: '127.0.0.1', port: 18497 }]);
+		await waitFor(() => engine.stats().peers === 2, 4000);
+		assert.ok(seen.includes('interested'), 'the exchanged peer received our handshake and interest');
+	} finally {
+		engine.stop();
+		sharer.close();
+		shared.close();
+	}
+});
+
+test('a peer that keeps choking is dropped for an untried address', async () => {
+	// One peer slot: the first address never unchokes, the second is a seed.
+	// After chokedIdleMs the engine must recycle the slot and finish the piece.
+	const { info, data } = makeTorrent(1, BLOCK_SIZE, BLOCK_SIZE);
+	let leecherClosed = false;
+	const leecher = nodePlatform.listen(18499, (conn) => void runMockPeer(conn, info.infoHash.bytes, data, undefined, { neverUnchoke: true }).then(() => { leecherClosed = true; }), '127.0.0.1');
+	const seed = nodePlatform.listen(18500, (conn) => void runMockPeer(conn, info.infoHash.bytes, data), '127.0.0.1');
+	const engine = new TorrentEngine(nodePlatform, { info, maxPeers: 1, chokedIdleMs: 300 });
+	try {
+		await engine.prepare({ infoHash: info.infoHash, announce: [], fileIdx: null });
+		engine.addPeers([{ ip: '127.0.0.1', port: 18499 }, { ip: '127.0.0.1', port: 18500 }]);
+		await waitFor(() => engine.bufferedFrom(0) === BLOCK_SIZE, 4000);
+		assert.deepEqual(engine.read(0, BLOCK_SIZE), data);
+		await waitFor(() => leecherClosed, 1000);
+		assert.equal(engine.stats().peers, 1);
+	} finally {
+		engine.stop();
+		leecher.close();
+		seed.close();
+	}
+});

@@ -5,7 +5,7 @@
  * per-second stats line; the caller draws `video` and `status`.
  */
 import type { TorrentEngine } from '../torrent/engine';
-import { HttpStream, HTTP_CHUNK } from './http-stream';
+import { HttpStream, HTTP_CHUNK, HTTP_LANES } from './http-stream';
 import { bufferTargets } from './buffering';
 import { probes } from './main';
 import { fetchTextLimited, type Addon } from '../stremio/addons';
@@ -14,9 +14,13 @@ import type { TrackOption } from './ui';
 
 const MiB = 1024 * 1024;
 const PROVIDE_CHUNK = 8 * MiB; // max bytes provided per step
+const MEMORY_SAMPLE_MS = 10_000;
+/** Minimum time between HTTP lane additions, so a new lane can show its effect on the rate. */
+const LANE_STEP_MS = 2000;
 
 export interface PlayerOptions {
-	log: (msg: string) => void;
+	/** `lazy` marks periodic lines the sink may batch (see main.ts). */
+	log: (msg: string, lazy?: boolean) => void;
 	/** Fires once playback actually starts (the screen switches to the video). */
 	onStarted?: () => void;
 	/** Fires when the video reaches its end. */
@@ -182,8 +186,14 @@ export class MediaPlayer {
 		let feedEvictMs = 0; // ... of which: evict + discard
 		let feedGapMs = 0; // longest pause between feed ticks (JS thread stalls)
 		let lastTick = performance.now();
-		let feeding = false;
-		let readingFrom = 0, readingTo = 0;
+		// HTTP lanes: concurrent range requests, each owning one entry in `pending`.
+		// The lane count adapts once per second in the stats tick: up while the
+		// buffer is starving below twice the bitrate, down to one on HTTP 429.
+		const pending: { from: number; to: number; next: number; abort: AbortController }[] = [];
+		let lanes = 0;
+		let laneTarget = 1;
+		let laneMax = HTTP_LANES;
+		let laneChangedAt = lastTick;
 		const cursorNow = () => { const wanted = source.wanted; return wanted >= 0 ? wanted : source.position; };
 		const updatePlayback = (cursor: number) => {
 			const ahead = source.buffered(cursor);
@@ -207,38 +217,48 @@ export class MediaPlayer {
 				}
 			}
 		};
-		const fillHttp = async () => {
-			feeding = true;
+		/** Next range to fetch: past the buffered and in-flight bytes, inside the goal window; none when caught up. */
+		const nextRange = (cursor: number) => {
+			let from = cursor;
+			for (let before = -1; before !== from;) {
+				before = from;
+				from += source.buffered(from);
+				for (const p of pending) if (p.from <= from && from < p.to) from = p.to;
+			}
+			// Leave one range of headroom instead of opening tiny top-up requests.
+			if (from >= file.length || from - cursor > targets.ahead - HTTP_CHUNK) return undefined;
+			return { from, to: Math.min(file.length, from + HTTP_CHUNK), next: from, abort: new AbortController() };
+		};
+		const runLane = async () => {
+			lanes++;
 			try {
 				while (!this.#stopped) {
 					const cursor = cursorNow();
-					const ahead = source.buffered(cursor);
 					updatePlayback(cursor);
-					readingFrom = cursor + ahead;
-					// Leave one range of headroom instead of opening tiny top-up requests.
-					if (readingFrom >= file.length || ahead > targets.ahead - HTTP_CHUNK) return;
-					readingTo = Math.min(file.length, readingFrom + HTTP_CHUNK);
-					await this.#http!.read(readingFrom, readingTo - readingFrom, (offset, bytes) => {
-						if (this.#stopped) throw new DOMException('Playback stopped.', 'AbortError');
-						const now = cursorNow();
-						const wanted = source.wanted;
-						if (wanted >= 0 && !source.buffered(wanted) && (wanted < readingFrom || wanted >= readingTo)) {
-							throw new DOMException('Seek changed the read range.', 'AbortError');
-						}
-						const keepFrom = Math.max(0, now - targets.behind), keepTo = Math.min(file.length, now + targets.ahead);
-						const from = Math.max(offset, keepFrom), to = Math.min(offset + bytes.length, keepTo);
-						if (from >= to) throw new DOMException('Seek changed the cache window.', 'AbortError');
-						const ioStart = performance.now();
-						source.retain(keepFrom, keepTo, prefix);
-						source.provide(from, bytes.subarray(from - offset, to - offset));
-						feedIoMs = Math.max(feedIoMs, performance.now() - ioStart);
-						updatePlayback(now);
-					});
+					const range = nextRange(cursor);
+					if (!range) return;
+					pending.push(range);
+					try {
+						await this.#http!.read(range.from, range.to - range.from, (offset, bytes) => {
+							if (this.#stopped) throw new DOMException('Playback stopped.', 'AbortError');
+							range.next = offset + bytes.length;
+							const now = cursorNow();
+							if (range.to <= now) throw new DOMException('Seek moved past this range.', 'AbortError');
+							const keepFrom = Math.max(0, now - targets.behind), keepTo = Math.min(file.length, now + targets.ahead);
+							const from = Math.max(offset, keepFrom), to = Math.min(offset + bytes.length, keepTo);
+							if (from >= to) throw new DOMException('Seek changed the cache window.', 'AbortError');
+							const ioStart = performance.now();
+							source.retain(keepFrom, keepTo, prefix);
+							source.provide(from, bytes.subarray(from - offset, to - offset));
+							feedIoMs = Math.max(feedIoMs, performance.now() - ioStart);
+							updatePlayback(now);
+						}, range.abort.signal);
+					} finally { pending.splice(pending.indexOf(range), 1); }
 					// Continue immediately while there is room for another full range.
 				}
 			} catch (error) {
 				if (!(error instanceof Error && error.name === 'AbortError')) this.#fail(error instanceof Error ? error : new Error('Video read failed.'));
-			} finally { feeding = false; }
+			} finally { lanes--; }
 		};
 		this.#feed = setInterval(() => {
 			if (this.#stopped) return;
@@ -255,8 +275,20 @@ export class MediaPlayer {
 			source.retain(Math.max(0, cursor - targets.behind), keepTo, prefix);
 			updatePlayback(cursor);
 			if (this.#http) {
-				if (feeding && ((want >= 0 && !source.buffered(want) && (want < readingFrom || want >= readingTo)) || readingFrom >= keepTo)) this.#http.cancel();
-				if (!feeding) void fillHttp();
+				for (const p of pending) {
+					// Drop a range behind the cursor or beyond the goal (a seek), and one
+					// whose delivery is a long way short of where the blocked decoder
+					// waits inside it (a seek landed there): a fresh lane starts exactly
+					// at the wanted offset. A lane the decoder merely caught up with is
+					// left alone; reconnecting would only lose a round trip.
+					const stale = p.to <= cursor || p.from >= keepTo;
+					const late = want >= 0 && want < p.to && want - p.next >= MiB;
+					if (stale || late) p.abort.abort();
+				}
+				// After a shrink, keep only the ranges nearest the cursor.
+				if (pending.length > laneTarget) for (const p of [...pending].sort((a, b) => a.from - b.from).slice(laneTarget)) p.abort.abort();
+				// A lane with nothing to fetch returns synchronously, so count first.
+				for (let n = laneTarget - lanes; n > 0; n--) void runLane();
 				feedMaxMs = Math.max(feedMaxMs, performance.now() - tickStart);
 				return;
 			}
@@ -288,12 +320,21 @@ export class MediaPlayer {
 		// Stats once per second; flags a stall (time not advancing while playing).
 		let lastPieces = 0;
 		let lastReceived = 0;
+		let lastThrottled = 0;
 		let lastTime = -1;
 		let lastRatePos = 0, lastSeekEpoch = this.#seekEpoch;
 		let lastStatsAt = performance.now();
 		let statsMs = 0;
+		// Switch.memoryUsage() walks the native heap (mallinfo: 10-30 ms, growing
+		// with fragmentation), so it is sampled every MEMORY_SAMPLE_MS, not per tick.
+		let heap = Switch.memoryUsage();
+		let heapSampledAt = lastStatsAt;
 		this.#stats = setInterval(() => {
 			const tickStart = performance.now();
+			if (tickStart - heapSampledAt >= MEMORY_SAMPLE_MS) {
+				heap = Switch.memoryUsage();
+				heapSampledAt = tickStart;
+			}
 			const s = engine?.stats();
 			const ratePieces = (s?.completedPieces ?? 0) - lastPieces;
 			lastPieces = s?.completedPieces ?? 0;
@@ -301,6 +342,16 @@ export class MediaPlayer {
 			const httpRate = (received - lastReceived) / MiB / Math.max(.001, (tickStart - lastStatsAt) / 1000);
 			lastStatsAt = tickStart;
 			lastReceived = received;
+			if (this.#http) {
+				if (this.#http.throttled > lastThrottled) {
+					if (laneTarget > 1) log('server throttled (HTTP 429): back to one connection');
+					laneTarget = laneMax = 1;
+				} else if (laneTarget < laneMax && tickStart - laneChangedAt >= LANE_STEP_MS && source.buffered(pos) < targets.ahead / 2 && httpRate * MiB < 2 * targets.rate) {
+					laneChangedAt = tickStart;
+					log(`delivery ${httpRate.toFixed(2)} MiB/s is below twice the bitrate: ${++laneTarget} connections`);
+				}
+				lastThrottled = this.#http.throttled;
+			}
 			const aheadMiB = (source.buffered(pos) / MiB).toFixed(1);
 			const t = video.currentTime;
 			const elapsed = t - lastTime, consumed = pos - lastRatePos;
@@ -312,21 +363,20 @@ export class MediaPlayer {
 			lastSeekEpoch = this.#seekEpoch;
 			const stalled = this.#started && !video.paused && lastTime >= 0 && t <= lastTime + 0.05;
 			lastTime = t;
-			const heap = Switch.memoryUsage();
 			const memory = engine?.memoryUsage();
 			const native = heap as unknown as { totalPhysicalSize?: number; nativeHeapTotal?: number; nativeHeapUsed?: number; dataArenaUsed?: number; dataArenaCommitted?: number; dataArenaSize?: number };
-			probes.lastHeap = heap.usedHeapSize;
 			const q = video.getVideoPlaybackQuality();
 			const frame = video.getFrameStats();
 			// Negative: the longest render pause ended before this tick; near 0: right at it.
 			const gapPhase = probes.gapAtMs ? Math.round(probes.gapAtMs - tickStart) : 0;
 			log(`decoder ${video.decoder} source ${video.videoWidth}x${video.videoHeight} render ${frame.width}x${frame.height} transfer max ${frame.transferMs.toFixed(1)} ms convert max ${frame.convertMs.toFixed(1)} ms | ` +
-				(s ? `peers ${s.peers} (dht ${s.dhtPeers}) | pieces ${s.completedPieces}/${s.totalPieces} (+${ratePieces}/s) | ` : `HTTP ${httpRate.toFixed(2)} MiB/s requests ${this.#http?.requests ?? 0} retries ${this.#http?.retries ?? 0} | `) +
+				(s ? `peers ${s.peers} (dht ${s.dhtPeers}) | pieces ${s.completedPieces}/${s.totalPieces} (+${ratePieces}/s) | ` : `HTTP ${httpRate.toFixed(2)} MiB/s lanes ${pending.length}/${laneTarget} requests ${this.#http?.requests ?? 0} retries ${this.#http?.retries ?? 0} | `) +
 					`buffer ${this.#rebuffering ? 'refilling' : this.#userPaused ? 'paused' : this.#started ? 'playing' : 'starting'} est ${(source.buffered(pos) / targets.rate).toFixed(1)}s goal ${(targets.ahead / MiB).toFixed(0)} MiB prefix ${(prefix / MiB).toFixed(1)} MiB | ` +
 					`ahead ${aheadMiB} MiB | buffers cache ${((memory?.cachedBytes ?? 0) / MiB).toFixed(1)} partial ${((memory?.partialBytes ?? 0) / MiB).toFixed(1)} source ${(source.storedBytes / MiB).toFixed(1)} MiB v8physical ${((native.totalPhysicalSize ?? 0) / MiB).toFixed(0)} nativeFree ${(((native.nativeHeapTotal ?? 0) - (native.nativeHeapUsed ?? 0)) / MiB).toFixed(0)} fonts ${fonts.size} | t=${t.toFixed(0)}s${stalled ? ' STALL' : ''} | ` +
 					`dataArena live/committed/limit ${((native.dataArenaUsed ?? 0) / MiB).toFixed(0)}/${((native.dataArenaCommitted ?? 0) / MiB).toFixed(0)}/${((native.dataArenaSize ?? 0) / MiB).toFixed(0)} MiB | ` +
-					`frames ${q.totalVideoFrames}/${q.droppedVideoFrames} dropped | feed max ${feedMaxMs.toFixed(0)} ms (io ${feedIoMs.toFixed(0)} ev ${feedEvictMs.toFixed(0)}) gap ${feedGapMs.toFixed(0)} ms stats ${statsMs.toFixed(0)} ms render max ${probes.renderMaxMs.toFixed(0)} (draw ${probes.drawMaxMs.toFixed(0)}) gap ${probes.renderGapMs.toFixed(0)} @${gapPhase} heap ${(probes.heapBeforeGap / MiB).toFixed(1)}->${(probes.heapAfterGap / MiB).toFixed(1)} log ${probes.logMaxMs.toFixed(0)} ms | ` +
+					`frames ${q.totalVideoFrames}/${q.droppedVideoFrames} dropped | feed max ${feedMaxMs.toFixed(0)} ms (io ${feedIoMs.toFixed(0)} ev ${feedEvictMs.toFixed(0)}) gap ${feedGapMs.toFixed(0)} ms stats ${statsMs.toFixed(0)} ms render max ${probes.renderMaxMs.toFixed(0)} (draw ${probes.drawMaxMs.toFixed(0)}) gap ${probes.renderGapMs.toFixed(0)} @${gapPhase} log ${probes.logMaxMs.toFixed(0)} ms | ` +
 					`diag ${probes.diag} conn ${s ? `${s.connectAttempts - s.connectFailures}/${s.connectAttempts}` : 'HTTP'} | heap ${(heap.usedHeapSize / MiB).toFixed(0)}/${(heap.heapSizeLimit / MiB).toFixed(0)} MiB ext ${((heap as unknown as { externalMemory?: number }).externalMemory ?? 0) / MiB | 0} v8malloc ${((heap as unknown as { mallocedMemory?: number }).mallocedMemory ?? 0) / MiB | 0} native ${((heap as unknown as { nativeHeapUsed?: number }).nativeHeapUsed ?? 0) / MiB | 0} MiB | pos ${(pos / MiB).toFixed(1)}`,
+				true,
 			);
 			this.status =
 				`t=${t.toFixed(0)}s | ahead ${aheadMiB} MiB | ${s ? `peers ${s.peers} | pieces ${s.completedPieces}/${s.totalPieces}` : 'HTTP stream'} | ` +

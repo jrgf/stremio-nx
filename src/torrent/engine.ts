@@ -20,6 +20,8 @@ export interface EngineOptions {
 	maxPeers?: number;
 	/** Max block requests kept in flight per peer. */
 	pipelineDepth?: number;
+	/** A peer still choking us this long after connecting or its last block is dropped for a fresh address. */
+	chokedIdleMs?: number;
 	listenPort?: number;
 	log?: (msg: string) => void;
 	/** Preloaded info (from a .torrent) to skip the metadata phase. */
@@ -83,6 +85,8 @@ export class TorrentEngine {
 	#announcing = false;
 	/** Peers holding an outstanding request for each block ("index:begin"). */
 	#blockPeers = new Map<string, Set<Peer>>();
+	/** When each connected peer last delivered a block (or connected). */
+	#lastUseful = new Map<Peer, number>();
 
 	constructor(platform: Platform, opts: EngineOptions = {}) {
 		this.#platform = platform;
@@ -90,6 +94,7 @@ export class TorrentEngine {
 		this.#opts = {
 			maxPeers: opts.maxPeers ?? 30,
 			pipelineDepth: opts.pipelineDepth ?? 16,
+			chokedIdleMs: opts.chokedIdleMs ?? 60_000,
 			listenPort: opts.listenPort ?? 6881,
 			log: opts.log ?? (() => {}),
 		};
@@ -216,6 +221,7 @@ export class TorrentEngine {
 		this.#pieces = undefined;
 		this.#metadata = undefined;
 		this.#blockPeers.clear();
+		this.#lastUseful.clear();
 		this.#knownAddrs = [];
 	}
 
@@ -261,8 +267,13 @@ export class TorrentEngine {
 	}
 
 	#mergeAddrs(addrs: PeerAddr[]): void {
+		// Bounded: PEX from a large swarm can hand us thousands of addresses.
+		const MAX_KNOWN = 2000;
 		const known = new Set(this.#knownAddrs.map((a) => `${a.ip}:${a.port}`));
-		for (const a of addrs) if (!known.has(`${a.ip}:${a.port}`)) this.#knownAddrs.push(a);
+		for (const a of addrs) {
+			if (this.#knownAddrs.length >= MAX_KNOWN) break;
+			if (!known.has(`${a.ip}:${a.port}`)) this.#knownAddrs.push(a);
+		}
 	}
 
 	#downloadSpeed(): number {
@@ -295,11 +306,36 @@ export class TorrentEngine {
 			for (const peer of this.#peers.values()) void peer.sendKeepAlive().catch(() => {});
 		}
 		if (!this.info) this.#driveMetadata();
-		else this.#driveDownload();
+		else {
+			this.#recycleChoked(now);
+			this.#driveDownload();
+		}
+	}
+
+	/**
+	 * Small swarms hide their few seeds behind many leechers that never unchoke
+	 * a client that uploads nothing. Once the download runs, a peer still choking
+	 * us after `chokedIdleMs` gives its slot to an untried address.
+	 */
+	#recycleChoked(now: number): void {
+		if (this.#knownAddrs.length === 0) return;
+		for (const [key, peer] of this.#peers) {
+			if (!peer.peerChoking || now - (this.#lastUseful.get(peer) ?? now) < this.#opts.chokedIdleMs) continue;
+			this.#dropPeer(key, peer);
+			this.#opts.log(`dropped choked peer ${key}; ${this.#knownAddrs.length} addresses left to try`);
+		}
+	}
+
+	#dropPeer(key: string, peer: Peer): void {
+		this.#peers.delete(key);
+		this.#forgetPeer(peer);
+		void peer.close();
 	}
 
 	#connectMore(): void {
-		const MAX_CONNECTING = 8;
+		// Bounded by the socket buffer pool (see nxjs.ini); each pending attempt
+		// holds one socket until it settles or times out.
+		const MAX_CONNECTING = 16;
 		const target = this.#opts.maxPeers;
 		while (
 			this.#peers.size + this.#connecting.size < target &&
@@ -322,6 +358,7 @@ export class TorrentEngine {
 				onUnchoke: () => {},
 				onPiece: (index, begin, block) => void this.#onPiece(self, index, begin, block),
 				onMetadata: (payload) => this.#onMetadataMessage(payload),
+				onPex: (added) => { if (this.#running) this.addPeers(added); },
 				onClose: () => {
 					this.#peers.delete(key);
 					if (self) this.#forgetPeer(self);
@@ -332,6 +369,7 @@ export class TorrentEngine {
 			await peer.sendInterested();
 			if (!this.#running) { await peer.close(); return; }
 			this.#peers.set(key, peer);
+			this.#lastUseful.set(peer, this.#platform.now());
 		} catch {
 			await self?.close();
 			this.#connectFailures++; // dropped: timed out, refused or a bad handshake
@@ -405,6 +443,7 @@ export class TorrentEngine {
 	async #onPiece(from: Peer | undefined, index: number, begin: number, block: Uint8Array): Promise<void> {
 		const pieces = this.#pieces;
 		if (!this.#running || !pieces) return;
+		if (from) this.#lastUseful.set(from, this.#platform.now());
 		this.#cancelElsewhere(from, index, begin, block.length);
 		const result = await pieces.onBlock(index, begin, block);
 		if (result === 'completed' && this.#running && this.#pieces === pieces) this.#downloadedBytes += pieces.pieceSize(index);
@@ -428,6 +467,7 @@ export class TorrentEngine {
 	}
 
 	#forgetPeer(peer: Peer): void {
+		this.#lastUseful.delete(peer);
 		for (const [key, holders] of this.#blockPeers) {
 			holders.delete(peer);
 			if (holders.size === 0) this.#blockPeers.delete(key);

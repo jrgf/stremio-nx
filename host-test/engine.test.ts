@@ -72,7 +72,8 @@ test('peers shared through ut_pex are connected', async () => {
 		await engine.prepare({ infoHash: info.infoHash, announce: [], fileIdx: null });
 		engine.addPeers([{ ip: '127.0.0.1', port: 18497 }]);
 		await waitFor(() => engine.stats().peers === 2, 4000);
-		assert.ok(seen.includes('interested'), 'the exchanged peer received our handshake and interest');
+		// The mock reads our `interested` after the engine counts the peer; wait for it.
+		await waitFor(() => seen.includes('interested'), 2000);
 	} finally {
 		engine.stop();
 		sharer.close();

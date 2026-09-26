@@ -146,7 +146,8 @@ for (const transport of ['HTTP', 'torrent']) {
 	player.start();
 	try {
 		const t0 = Date.now();
-		while (active < 3) { assert.ok(Date.now() - t0 < 6000, `starving playback must open up to three connections:\n${logs.slice(-3).join('\n')}`); await new Promise(resolve => setTimeout(resolve, 25)); }
+		// Lanes grow at the 2nd and 4th stats ticks (about 4 s); allow for slow CI timers.
+		while (active < 3) { assert.ok(Date.now() - t0 < 10000, `starving playback must open up to three connections:\n${logs.slice(-3).join('\n')}`); await new Promise(resolve => setTimeout(resolve, 25)); }
 		assert.equal(new Set(ranges.map(r => r.start)).size, ranges.length, 'lanes fetch distinct ranges');
 		assert.ok(ranges.every(r => r.end < 48 * MiB), 'lanes stay inside the read-ahead goal');
 		deny = 1; delay = 5; input.cancel();

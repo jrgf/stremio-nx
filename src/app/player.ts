@@ -15,8 +15,8 @@ import type { TrackOption } from './ui';
 const MiB = 1024 * 1024;
 const PROVIDE_CHUNK = 8 * MiB; // max bytes provided per step
 const MEMORY_SAMPLE_MS = 10_000;
-/** Minimum time between HTTP lane additions, so a new lane can show its effect on the rate. */
-const LANE_STEP_MS = 2000;
+/** Stats ticks (1 s each) between HTTP lane additions, so a new lane can show its effect on the rate. */
+const LANE_STEP_TICKS = 2;
 
 export interface PlayerOptions {
 	/** `lazy` marks periodic lines the sink may batch (see main.ts). */
@@ -193,7 +193,7 @@ export class MediaPlayer {
 		let lanes = 0;
 		let laneTarget = 1;
 		let laneMax = HTTP_LANES;
-		let laneChangedAt = lastTick;
+		let laneTicks = 0; // stats ticks since the lane count last changed
 		const cursorNow = () => { const wanted = source.wanted; return wanted >= 0 ? wanted : source.position; };
 		const updatePlayback = (cursor: number) => {
 			const ahead = source.buffered(cursor);
@@ -343,11 +343,12 @@ export class MediaPlayer {
 			lastStatsAt = tickStart;
 			lastReceived = received;
 			if (this.#http) {
+				laneTicks++;
 				if (this.#http.throttled > lastThrottled) {
 					if (laneTarget > 1) log('server throttled (HTTP 429): back to one connection');
 					laneTarget = laneMax = 1;
-				} else if (laneTarget < laneMax && tickStart - laneChangedAt >= LANE_STEP_MS && source.buffered(pos) < targets.ahead / 2 && httpRate * MiB < 2 * targets.rate) {
-					laneChangedAt = tickStart;
+				} else if (laneTarget < laneMax && laneTicks >= LANE_STEP_TICKS && source.buffered(pos) < targets.ahead / 2 && httpRate * MiB < 2 * targets.rate) {
+					laneTicks = 0;
 					log(`delivery ${httpRate.toFixed(2)} MiB/s is below twice the bitrate: ${++laneTarget} connections`);
 				}
 				lastThrottled = this.#http.throttled;
